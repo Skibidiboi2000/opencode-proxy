@@ -329,11 +329,8 @@ def test_zen_stream_parsed_frees_usage_midstream_emits_rate_limit_error(monkeypa
 
     status, err, chunks = asyncio.get_event_loop().run_until_complete(run())
     assert status == 200
-    events = _run_stream(chunks)
-    assert events[0]["choices"][0]["delta"]["content"] == "a"
-    assert events[1]["type"] == "error"
-    assert "rate_limit_error" in events[1]["error"]["type"]
-    assert len(events) == 2
+    with pytest.raises(proxy.UpstreamDead):
+        _run_stream(chunks)
 
 
 def test_anthropic_events_empty_stream_emits_terminal():
@@ -439,10 +436,8 @@ def test_stream_rate_limit_after_first_256_bytes_is_normalized(monkeypatch):
     the normalized 429 SSE error event, not leak raw to the client."""
     padding = b'data: {"choices":[{"delta":{"content":"aaaaaaaaaa"}}]}\n\n' * 12  # 432 bytes
     content = padding + b'data: {"type":"error","error":{"type":"FreeUsageLimitError"}}\n\n'
-    status, err, data = _stream_case(monkeypatch, content)
-    assert status == 200
-    assert b"Rate limit exceeded" in data
-    assert b"FreeUsageLimitError" not in data
+    with pytest.raises(proxy.UpstreamDead):
+        _stream_case(monkeypatch, content)
 
 
 def test_stream_tool_calls_marker_split_across_chunk_boundary_detected(monkeypatch):
@@ -454,22 +449,20 @@ def test_stream_tool_calls_marker_split_across_chunk_boundary_detected(monkeypat
 
 
 def test_keepalive_wrapper_emits_error_event_on_upstream_exception():
-    """A mid-stream upstream exception must become an SSE error + [DONE],
-    not a silently truncated stream."""
+    """A mid-stream upstream exception must ABORT the stream (re-raise), not
+    be converted into a clean error+[DONE] the router reads as success."""
 
     async def broken():
         yield b"data: one\n\n"
         raise httpx.ReadTimeout("read timed out")
 
-    out = b"".join(_run_stream(proxy._keepalive_wrapper(broken(), interval=0.05)))
-    assert b"data: one" in out
-    assert b'"error"' in out
-    assert b"[DONE]" in out
+    with pytest.raises(httpx.ReadTimeout):
+        b"".join(_run_stream(proxy._keepalive_wrapper(broken(), interval=0.05)))
 
 
 def test_relay_openai_stream_connect_error_yields_sse_error(monkeypatch):
-    """An upstream connect failure must surface as an SSE error event + [DONE],
-    not escape the generator and kill the connection."""
+    """An upstream connect failure must propagate (abort) — never a clean
+    error+[DONE] the router would parse as an empty success."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
@@ -488,10 +481,8 @@ def test_relay_openai_stream_connect_error_yields_sse_error(monkeypatch):
             return out, e
 
     out, escaped = asyncio.get_event_loop().run_until_complete(collect())
-    assert escaped is None, f"exception escaped the relay: {escaped!r}"
-    data = b"".join(out)
-    assert b'"error"' in data
-    assert b"[DONE]" in data
+    assert isinstance(escaped, httpx.ConnectError), f"expected abort, got clean end: {escaped!r}"
+    assert b"[DONE]" not in b"".join(out)
 
 
 def test_chat_completions_route_upstream_connect_error_yields_sse_error(monkeypatch):
@@ -736,20 +727,36 @@ def test_stream_does_not_mistake_error_name_in_content_for_rate_limit(monkeypatc
 def test_stream_truncated_midway_yields_error_event_not_silent_done(monkeypatch):
     """A stream that delivers content then just ENDS (no finish_reason, no
     usage frame, no [DONE]) was cut upstream (Zen kills long free-tier
-    streams). The proxy must surface an SSE error event so 9Router retries,
-    NOT paper over it with a synthetic [DONE] 'success' (user saw the model
-    stop mid-sentence with no error)."""
+    streams). The relay must ABORT the connection (premature close) so 9Router
+    classifies the model as failed — NOT paper over it with a synthetic [DONE]
+    'success' (user saw the model stop mid-sentence with no error)."""
     content = (
         b'data: {"choices":[{"index":0,"delta":{"content":"meaning in Hebbian networks:"},"finish_reason":null}]}\n\n'
         b'data: {"choices":[{"index":0,"delta":{"content":" here comes the lis"},"finish_reason":null}]}\n\n'
     )
-    status, err, data = _stream_case(monkeypatch, content)
-    assert status == 200
-    assert b"meaning in Hebbian" in data      # partial content still relayed
-    assert b'"error"' in data                 # ...but flagged as failed
-    assert b"ended before completion" in data
-    done_lines = [l for l in data.split(b"\n") if l.strip() in (b"data: [DONE]", b"data:[DONE]")]
-    assert len(done_lines) == 1               # single terminal DONE after the error
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=content, headers={"Content-Type": "text/event-stream"})
+
+    _client_with_mock(monkeypatch, handler)
+
+    partial = []
+
+    async def run():
+        status, err, chunks = await proxy._zen_stream_upstream(
+            "http://upstream-mock/v1/chat/completions", {}, {"stream": True}, "1.2.3.4"
+        )
+        assert status == 200 and err is None
+        async for c in chunks:
+            partial.append(c)
+        return b""
+
+    with pytest.raises(proxy.UpstreamDead):
+        asyncio.get_event_loop().run_until_complete(run())
+    data = b"".join(partial)
+    # partial content was relayed before the abort; no clean terminal
+    assert b"meaning in Hebbian" in data
+    assert b"[DONE]" not in data
 
 
 def test_stream_usage_without_done_still_gets_clean_synthetic_done(monkeypatch):
@@ -793,9 +800,8 @@ def test_stream_reasoning_only_cut_reports_reasoning_flag(monkeypatch, caplog):
         b'data: {"choices":[{"delta":{"reasoning_content":" still thinking..."},"finish_reason":null}]}\n\n'
     )
     with caplog.at_level(logging.INFO, logger="opencode-proxy"):
-        status, err, data = _stream_case(monkeypatch, content)
-    assert status == 200
-    assert b'"error"' in data  # still an error so 9Router can retry/fallback
+        with pytest.raises(proxy.UpstreamDead):
+            status, err, data = _stream_case(monkeypatch, content)
     joined = " ".join(r.getMessage() for r in caplog.records)
     assert "reasoning=True" in joined
     assert "content=False" in joined
@@ -1048,3 +1054,517 @@ def test_stream_relay_continues_after_probe_stops_at_first_frame(monkeypatch):
     assert b'"finish_reason":"stop"' in resp.content
     assert b'"error"' not in resp.content
     assert resp.content.count(b"[DONE]") == 1
+
+
+# --- Responses API: probe liveness + muse-spark bridge ---
+# zen's /chat/completions 500s for muse-spark (Console), but /responses works —
+# the opencode CLI itself talks Responses API for this model. 9Router only
+# speaks chat/completions, so the proxy must bridge, and the probe must
+# understand Responses-format frames (no choices[] — different liveness).
+
+
+def _responses_sse_events():
+    return (
+        b'event: response.created\ndata: {"type":"response.created","response":{"id":"r1"}}\n\n'
+        b'event: response.in_progress\ndata: {"type":"response.in_progress","response":{}}\n\n'
+        b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"id":"m1","type":"message","role":"assistant","content":[]}}\n\n'
+        b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Four"}\n\n'
+        b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":" teen"}\n\n'
+        b'event: ping\ndata: {"type":"ping"}\n\n'
+        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"r1","status":"completed","usage":{"input_tokens":17,"output_tokens":555,"total_tokens":572}}}\n\n'
+    )
+
+
+def test_probe_recognizes_responses_format_liveness(monkeypatch):
+    """Responses-API SSE (event:/data: with response.* types, no choices[]) is
+    alive the moment output_text deltas flow — must NOT be declared dead."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_responses_sse_events(), headers={"Content-Type": "text/event-stream"})
+
+    _client_with_mock(monkeypatch, handler)
+
+    async def run():
+        return await proxy._zen_stream_parsed(
+            "http://upstream-mock/v1/responses", {}, {"stream": True}, "1.2.3.4"
+        )
+
+    status, err, chunks = asyncio.get_event_loop().run_until_complete(run())
+    assert status == 200, f"probe killed a live Responses stream: {err}"
+    assert err is None
+    objs = _run_stream(chunks)
+    types = [o.get("type") for o in objs if isinstance(o, dict)]
+    assert "response.output_text.delta" in types
+
+
+def test_chat_completions_muse_spark_bridges_to_responses(monkeypatch):
+    """chat/completions for muse-spark must be served from zen's /responses
+    endpoint (chat/completions 500s server-side) and translated back to
+    chat.completion.chunk SSE."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            return httpx.Response(
+                500,
+                json={"type": "error", "error": {"type": "error", "message": "Internal server error"}},
+            )
+        assert request.url.path.endswith("/responses"), request.url.path
+        rbody = json.loads(request.content)
+        assert rbody["input"], "messages must be translated to input items"
+        assert rbody.get("max_output_tokens", 0) >= 2048, "reasoning headroom required"
+        return httpx.Response(200, content=_responses_sse_events(), headers={"Content-Type": "text/event-stream"})
+
+    _client_with_mock(monkeypatch, handler)
+    client = TestClient(proxy.app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "muse-spark-1.2-contributor-free", "stream": True, "max_tokens": 64,
+              "messages": [{"role": "user", "content": "say ok"}]},
+    )
+    assert resp.status_code == 200, resp.text[:200]
+    assert b'"content":"Four"' in resp.content
+    assert b'"finish_reason":"stop"' in resp.content
+    assert b'"prompt_tokens":17' in resp.content
+    assert b'"completion_tokens":555' in resp.content
+    assert b'"error"' not in resp.content
+    assert resp.content.count(b"[DONE]") == 1
+
+
+def test_chat_to_responses_request_translation():
+    out = proxy._chat_to_responses(
+        {
+            "model": "muse-spark-1.2-contributor-free",
+            "max_tokens": 512,
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                                                      "function": {"name": "f", "arguments": "{\"a\":1}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "result"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object"}}}],
+        }
+    )
+    assert out["instructions"] == "be brief"
+    types = [i.get("type", i.get("role")) for i in out["input"]]
+    assert types == ["user", "function_call", "function_call_output"]
+    assert out["input"][0]["content"] == [{"type": "input_text", "text": "hi"}]
+    assert out["input"][1] == {"type": "function_call", "call_id": "c1", "name": "f", "arguments": '{"a":1}'}
+    assert out["input"][2] == {"type": "function_call_output", "call_id": "c1", "output": "result"}
+    assert out["tools"] == [{"type": "function", "name": "f", "description": "d", "parameters": {"type": "object"}}]
+    assert out["max_output_tokens"] == 2048  # reasoning headroom bump
+
+
+def test_responses_events_translate_to_chat_chunks():
+    events = iter([
+        {"type": "response.output_item.added", "item": {"id": "m1", "type": "message", "role": "assistant", "content": []}},
+        {"type": "response.output_text.delta", "delta": "Four"},
+        {"type": "response.completed", "response": {"id": "r1", "status": "completed",
+                                                    "usage": {"input_tokens": 17, "output_tokens": 555, "total_tokens": 572}}},
+    ])
+
+    async def gen():
+        for e in events:
+            yield e
+
+    out = b"".join(_run_stream(proxy._responses_events_to_chat(gen()))).decode()
+    assert '"content":"Four"' in out
+    assert '"finish_reason":"stop"' in out
+    assert '"prompt_tokens":17' in out
+    assert '"completion_tokens":555' in out
+    assert out.count("[DONE]") == 1
+
+
+def test_responses_incomplete_maps_length_finish():
+    events = iter([
+        {"type": "response.output_text.delta", "delta": "par"},
+        {"type": "response.incomplete", "response": {"status": "incomplete",
+                                                     "usage": {"input_tokens": 10, "output_tokens": 2048, "total_tokens": 2058}}},
+    ])
+
+    async def gen():
+        for e in events:
+            yield e
+
+    out = b"".join(_run_stream(proxy._responses_events_to_chat(gen()))).decode()
+    assert '"finish_reason":"length"' in out
+    assert '"completion_tokens":2048' in out
+    assert out.count("[DONE]") == 1
+
+
+def test_chat_via_responses_non_stream(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            return httpx.Response(500, json={"error": {"message": "Internal server error"}})
+        return httpx.Response(200, json={
+            "id": "resp_1", "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "Four"}]},
+            ],
+            "usage": {"input_tokens": 17, "output_tokens": 555, "total_tokens": 572},
+        })
+
+    _client_with_mock(monkeypatch, handler)
+    client = TestClient(proxy.app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "muse-spark-1.2-contributor-free", "stream": False,
+              "messages": [{"role": "user", "content": "say ok"}]},
+    )
+    assert resp.status_code == 200, resp.text[:200]
+    body = resp.json()
+    assert body["choices"][0]["message"]["content"] == "Four"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"]["completion_tokens"] == 555
+
+
+# --- Upstream retry: zen's 503s are ~1s transient blips; the opencode CLI
+# survives them via internal retries, so the proxy must too (9Router surfaces
+# first-failure to the harness instead of retrying). ---
+
+
+def test_stream_retries_transient_503_then_succeeds(monkeypatch):
+    """A 503 that clears on the next attempt must never reach the client."""
+    monkeypatch.setattr(proxy, "UPSTREAM_RETRY_BACKOFF", 0.01)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(503, json={"error": {"message": "Endpoint is unavailable."}})
+        return httpx.Response(
+            200,
+            content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    _client_with_mock(monkeypatch, handler)
+
+    async def run():
+        return await proxy._zen_stream_upstream(
+            "http://upstream-mock/v1/chat/completions", {}, {"stream": True}, "1.2.3.4"
+        )
+
+    status, err, chunks = asyncio.get_event_loop().run_until_complete(run())
+    assert status == 200, f"expected retry to succeed, got {status}: {err}"
+    assert calls["n"] == 3
+    data = b"".join(_run_stream(chunks)).decode()
+    assert '"content":"ok"' in data
+
+
+def test_stream_retries_exhausted_surfaces_last_status(monkeypatch):
+    monkeypatch.setattr(proxy, "UPSTREAM_RETRY_BACKOFF", 0.01)
+    monkeypatch.setattr(proxy, "UPSTREAM_RETRIES", 2)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, json={"error": {"message": "Endpoint is unavailable."}})
+
+    _client_with_mock(monkeypatch, handler)
+
+    async def run():
+        return await proxy._zen_stream_upstream(
+            "http://upstream-mock/v1/chat/completions", {}, {"stream": True}, "1.2.3.4"
+        )
+
+    status, err, chunks = asyncio.get_event_loop().run_until_complete(run())
+    assert status == 503
+    assert calls["n"] == 3  # 1 initial + 2 retries
+    assert chunks is None
+
+
+def test_stream_does_not_retry_429(monkeypatch):
+    """429 is quota, not a blip — retrying amplifies load on an exhausted pool."""
+    monkeypatch.setattr(proxy, "UPSTREAM_RETRY_BACKOFF", 0.01)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, json={"error": {"message": "Rate limit exceeded"}})
+
+    _client_with_mock(monkeypatch, handler)
+
+    async def run():
+        return await proxy._zen_stream_upstream(
+            "http://upstream-mock/v1/chat/completions", {}, {"stream": True}, "1.2.3.4"
+        )
+
+    status, err, chunks = asyncio.get_event_loop().run_until_complete(run())
+    assert status == 429
+    assert calls["n"] == 1
+
+
+def test_nonstream_retries_transient_503(monkeypatch):
+    monkeypatch.setattr(proxy, "UPSTREAM_RETRY_BACKOFF", 0.01)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 2:
+            return httpx.Response(503, json={"error": {"message": "Endpoint is unavailable."}})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]})
+
+    _client_with_mock(monkeypatch, handler)
+    client = TestClient(proxy.app)
+    resp = client.post("/v1/chat/completions", json={"model": "m", "messages": [], "stream": False})
+    assert resp.status_code == 200
+    assert calls["n"] == 2
+
+
+def test_retry_backoff_spreads_exponentially(monkeypatch):
+    """Backoff must widen (1x, 2x, 4x...) — zen's 503 streaks outlast a linear
+    3s window; an exponential spread covers ~7s within the same attempt count
+    while total pre-commit time stays under 9Router's ~25s first-byte kill."""
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr(proxy.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(proxy, "UPSTREAM_RETRY_BACKOFF", 1.0)
+    monkeypatch.setattr(proxy, "UPSTREAM_RETRIES", 3)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, json={"error": {"message": "Endpoint is unavailable."}})
+
+    _client_with_mock(monkeypatch, handler)
+
+    async def run():
+        return await proxy._zen_stream_upstream(
+            "http://upstream-mock/v1/chat/completions", {}, {"stream": True}, "1.2.3.4"
+        )
+
+    asyncio.get_event_loop().run_until_complete(run())
+    assert calls["n"] == 4  # 1 initial + 3 retries
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+# --- Post-commit failures must ABORT, not emit clean SSE errors ---
+# 9Router parses a well-formed error-frame + [DONE] stream as a completed
+# (empty) success — 'succeeded · IN 0 · OUT 0' — and the harness re-fires
+# 400KB payloads forever. An aborted connection is the only signal it
+# classifies as a model failure.
+
+
+def test_pending_path_upstream_error_aborts_connection(monkeypatch):
+    """Upstream still failing when the hold window expires: 200 is committed
+    (keepalives flow), but when the task finally returns an error the relay
+    must RAISE — not yield a parseable error frame + [DONE]."""
+    monkeypatch.setattr(proxy, "STATUS_HOLD_SECS", 0.05)
+    monkeypatch.setattr(proxy, "UPSTREAM_RETRY_BACKOFF", 0.01)
+    monkeypatch.setattr(proxy, "UPSTREAM_RETRIES", 0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(0.2)  # upstream answers after hold expiry
+        return httpx.Response(503, json={"error": {"message": "Endpoint is unavailable."}})
+
+    _client_with_mock(monkeypatch, handler)
+
+    async def run():
+        task = asyncio.create_task(
+            proxy._zen_stream_upstream("http://upstream-mock/v1/chat/completions", {}, {"stream": True}, "1.2.3.4")
+        )
+        await asyncio.sleep(0.3)  # hold expires, task completes with error
+        relay = proxy._relay_from_task(task)
+        out = b""
+        async for c in relay:
+            out += c
+        return out
+
+    with pytest.raises(proxy.UpstreamDead, match="503"):
+        asyncio.get_event_loop().run_until_complete(run())
+
+
+def test_post_commit_dead_stream_aborts_not_clean_done(monkeypatch):
+    """Zen accepts (200), the probe window expires on silence, then the stream
+    terminates with finish_reason:network_error AFTER commit — the relay must
+    abort the connection, not deliver a clean [DONE] the router reads as an
+    empty success."""
+    monkeypatch.setattr(proxy, "STATUS_HOLD_SECS", 0.05)
+
+    async def sse_bytes():
+        yield b'data: {"choices":[]}\n\n'  # heartbeat junk: no liveness signal
+        await asyncio.sleep(0.2)  # probe window expires during the silence
+        yield (
+            b'data: {"choices":[{"index":0,"finish_reason":"network_error",'
+            b'"delta":{"role":"assistant","content":""}}]}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=sse_bytes(), headers={"Content-Type": "text/event-stream"})
+
+    _client_with_mock(monkeypatch, handler)
+
+    async def run():
+        status, err, chunks = await proxy._zen_stream_upstream(
+            "http://upstream-mock/v1/chat/completions", {}, {"stream": True}, "1.2.3.4"
+        )
+        assert status == 200 and err is None
+        out = b""
+        async for c in chunks:
+            out += c
+        return out
+
+    with pytest.raises(proxy.UpstreamDead):
+        asyncio.get_event_loop().run_until_complete(run())
+
+
+def test_midstream_error_frame_aborts(monkeypatch):
+    """An error frame arriving AFTER content was flowing (post-commit) must
+    abort the stream, not end it cleanly with [DONE]."""
+    content = (
+        b'data: {"choices":[{"delta":{"content":"working"}}]}\n\n'
+        b'data: {"type":"error","error":{"type":"api_error","message":"boom"}}\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=content, headers={"Content-Type": "text/event-stream"})
+
+    _client_with_mock(monkeypatch, handler)
+
+    async def run():
+        status, err, chunks = await proxy._zen_stream_upstream(
+            "http://upstream-mock/v1/chat/completions", {}, {"stream": True}, "1.2.3.4"
+        )
+        assert status == 200 and err is None
+        out = b""
+        async for c in chunks:
+            out += c
+        return out
+
+    with pytest.raises(proxy.UpstreamDead, match="boom"):
+        asyncio.get_event_loop().run_until_complete(run())
+
+
+# --- Pending-phase upstream retry: zen's 503 waves last minutes; the 7s
+# pre-commit window cannot cover them, but once 200 is committed the client
+# sits on keepalives (9Router tolerates 40s+ TTFT — proven in its own logs),
+# so retry the upstream behind the keepalives until it succeeds or the
+# budget expires. ---
+
+
+def test_pending_relay_retries_until_success(monkeypatch):
+    monkeypatch.setattr(proxy, "PENDING_RETRY_SECS", 30)
+    calls = {"n": 0}
+
+    def make_task():
+        # Production shape: a COROUTINE-returning factory (e.g.
+        # `lambda: _zen_stream_upstream(...)`), not a Task factory —
+        # regression for the AttributeError: 'coroutine' object has no
+        # attribute 'done' crash on the second pending attempt.
+        async def upstream():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return 503, "Endpoint is unavailable. (503)", None
+
+            async def chunks():
+                yield b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                yield b"data: [DONE]\n\n"
+
+            return 200, None, chunks()
+
+        return upstream()
+
+    async def run():
+        first = asyncio.create_task(make_task())
+        out = b""
+        async for c in proxy._pending_relay_with_retry(first, make_task, 30, proxy._relay_openai_chunks, interval=0.01):
+            out += c
+        return out
+
+    data = asyncio.get_event_loop().run_until_complete(run())
+    assert calls["n"] == 3
+    assert b'"content":"ok"' in data
+    assert data.count(b"[DONE]") == 1
+
+
+def test_pending_relay_raises_after_budget(monkeypatch):
+    monkeypatch.setattr(proxy, "PENDING_RETRY_SECS", 0.05)
+
+    def make_task():
+        async def task_body():
+            return 503, "Endpoint is unavailable. (503)", None
+
+        return asyncio.create_task(task_body())
+
+    async def run():
+        out = b""
+        async for c in proxy._pending_relay_with_retry(make_task(), make_task, 0.05, proxy._relay_openai_chunks, interval=0.01):
+            out += c
+        return out
+
+    with pytest.raises(proxy.UpstreamDead, match="503"):
+        asyncio.get_event_loop().run_until_complete(run())
+
+
+def test_responses_translator_raises_on_empty_completed():
+    """muse burning the whole budget on reasoning: completed with ZERO output —
+    a clean empty success for the harness. Must abort instead."""
+    events = iter([
+        {"type": "response.output_item.added", "item": {"id": "m1", "type": "message", "role": "assistant", "content": []}},
+        {"type": "response.completed", "response": {"id": "r1", "status": "completed",
+                                                    "usage": {"input_tokens": 100, "output_tokens": 0, "total_tokens": 100}}},
+    ])
+
+    async def gen():
+        for e in events:
+            yield e
+
+    with pytest.raises(proxy.UpstreamDead, match="empty"):
+        b"".join(_run_stream(proxy._responses_events_to_chat(gen())))
+
+
+def test_post_commit_clean_empty_aborts(monkeypatch):
+    """zen answers slowly with a WELL-FORMED but empty completion (finish stop,
+    zero tokens, [DONE]) after the probe window — post-commit that must abort,
+    not deliver a clean empty success."""
+    monkeypatch.setattr(proxy, "STATUS_HOLD_SECS", 0.05)
+
+    async def sse_bytes():
+        yield b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+        await asyncio.sleep(0.2)  # probe window expires during silence
+        yield b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":0}}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=sse_bytes(), headers={"Content-Type": "text/event-stream"})
+
+    _client_with_mock(monkeypatch, handler)
+
+    async def run():
+        status, err, chunks = await proxy._zen_stream_upstream(
+            "http://upstream-mock/v1/chat/completions", {}, {"stream": True}, "1.2.3.4"
+        )
+        assert status == 200 and err is None
+        out = b""
+        async for c in chunks:
+            out += c
+        return out
+
+    with pytest.raises(proxy.UpstreamDead, match="empty"):
+        asyncio.get_event_loop().run_until_complete(run())
+
+
+def test_nonstream_bridge_empty_returns_502(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "resp_1", "status": "completed",
+            "output": [{"type": "reasoning", "summary": []}],
+            "usage": {"input_tokens": 500, "output_tokens": 0, "total_tokens": 500},
+        })
+
+    _client_with_mock(monkeypatch, handler)
+    client = TestClient(proxy.app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "muse-spark-1.2-contributor-free", "stream": False,
+              "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 502, f"got {resp.status_code}: {resp.text[:150]}"
+    assert "empty" in resp.text.lower()

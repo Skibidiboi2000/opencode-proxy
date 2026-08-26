@@ -25,8 +25,24 @@ BROKE_MODE = os.environ.get("OPENCODE_BROKE", "").lower() in ("1", "true", "yes"
 # committing 200+SSE to the client. Failures arriving faster than this window
 # surface as real HTTP statuses (callers like 9Router can then lock/fallback);
 # slower upstreams fall back to 200 + keepalive streaming as before. Must stay
-# below the shortest downstream first-byte timeout (~25s on 9Router).
-STATUS_HOLD_SECS = float(os.environ.get("STATUS_HOLD_SECS", "20"))
+# below the shortest downstream first-byte timeout (~25s on 9Router) AFTER the
+# retry window: 7s worst-case backoff + 15s hold ≈ 22s.
+STATUS_HOLD_SECS = float(os.environ.get("STATUS_HOLD_SECS", "15"))
+
+# zen's 502/503s are ~1s transient blips. The opencode CLI survives them via
+# internal retries; 9Router surfaces first-failure to the harness instead.
+# Retry transient upstream failures here so both callers see a stable pipe.
+# 429 is quota, not a blip — never retried.
+UPSTREAM_RETRIES = int(os.environ.get("UPSTREAM_RETRIES", "2"))
+UPSTREAM_RETRY_BACKOFF = float(os.environ.get("UPSTREAM_RETRY_BACKOFF", "0.4"))
+_RETRYABLE_STATUSES = {502, 503, 504}
+
+# After the 200 is committed the client sits on keepalive comments — and
+# 9Router demonstrably tolerates 40s+ TTFT on that connection. zen's 503
+# waves last minutes, far longer than any pre-commit window, so once committed
+# we keep retrying the upstream behind the keepalives until it succeeds or
+# this budget runs out (kept below 9Router's own ~240s fetch timeout).
+PENDING_RETRY_SECS = float(os.environ.get("PENDING_RETRY_SECS", "120"))
 
 # Outbound proxy (e.g. socks5://warp:1080). httpx does not auto-read HTTP_PROXY
 # env vars for programmatic clients, so we pass it explicitly. Falls back to the
@@ -264,6 +280,20 @@ def _scan_frame(frame: bytes) -> dict:
         usage = obj.get("usage")
         if isinstance(usage, dict) and (usage.get("completion_tokens") or 0) > 0:
             info["live"] = True
+        # Responses-API frames (no choices[]): output deltas are live; the
+        # lifecycle terminals are done; response.failed is an error.
+        rtype = obj.get("type")
+        if isinstance(rtype, str) and rtype.startswith("response."):
+            if rtype.endswith(".delta") and isinstance(obj.get("delta"), str):
+                info["live"] = True
+            if rtype in ("response.completed", "response.incomplete"):
+                rusage = (obj.get("response") or {}).get("usage") or {}
+                if isinstance(rusage, dict) and (rusage.get("output_tokens") or 0) > 0:
+                    info["live"] = True
+                info["done"] = True
+            if rtype == "response.failed":
+                info["done"] = True
+                info["err"] = {"message": "response failed"}
     # Byte-level fallback mirrors the relay's own marker detection so probes
     # and relays can never disagree about whether a frame carried output.
     if b'"tool_calls"' in frame:
@@ -349,15 +379,37 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
     """Open a stream to Zen. Returns (200, None, iterator) on success or
     (status, detail, None) on error — so non-200 responses surface with the
     real HTTP status (pool-proxy then retries 429s properly)."""
-    client = _client(timeout=httpx.Timeout(180.0, connect=15.0))
-    try:
-        req = client.build_request("POST", url, headers=headers, json=body)
-        resp = await client.send(req, stream=True)
-    except BaseException:
-        # BaseException: CancelledError (client hung up before headers) must
-        # also release the connection, not just plain HTTP errors.
-        await client.aclose()
-        raise
+    attempt = 0
+    while True:
+        client = _client(timeout=httpx.Timeout(180.0, connect=15.0))
+        try:
+            req = client.build_request("POST", url, headers=headers, json=body)
+            resp = await client.send(req, stream=True)
+        except httpx.TransportError:
+            # Connect/read failures before any bytes: transient-safe to retry.
+            await client.aclose()
+            if attempt < UPSTREAM_RETRIES:
+                attempt += 1
+                delay = UPSTREAM_RETRY_BACKOFF * (2 ** (attempt - 1))
+                logger.warning("[RETRY] upstream transport error, attempt %d/%d in %.1fs", attempt, UPSTREAM_RETRIES + 1, delay)
+                await asyncio.sleep(delay)
+                continue
+            raise
+        except BaseException:
+            # BaseException: CancelledError (client hung up before headers) must
+            # also release the connection, not just plain HTTP errors.
+            await client.aclose()
+            raise
+        if resp.status_code in _RETRYABLE_STATUSES and attempt < UPSTREAM_RETRIES:
+            await resp.aread()
+            await resp.aclose()
+            await client.aclose()
+            attempt += 1
+            delay = UPSTREAM_RETRY_BACKOFF * (2 ** (attempt - 1))
+            logger.warning("[RETRY] upstream %s, attempt %d/%d in %.1fs", resp.status_code, attempt, UPSTREAM_RETRIES + 1, delay)
+            await asyncio.sleep(delay)
+            continue
+        break
     if resp.status_code != 200:
         raw = await resp.aread()
         await resp.aclose()
@@ -390,6 +442,7 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
         "done_sent": False,
         "stop": False,
         "relayed": 0,
+        "live": False,
     }
 
     def _has_non_null_finish(data: bytes) -> bool:
@@ -428,6 +481,11 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
             # Zen appends trailing frames (`data: {"choices":[],"cost":"0"}`)
             # after the real [DONE]; relay stops here so 9Router doesn't parse
             # empty choices as a dead model.
+            if not state["live"]:
+                # Clean [DONE] but zero usable output post-commit — abort so
+                # 9Router classifies the model as failed, not empty-success.
+                state["stop"] = True
+                raise UpstreamDead("no usable content (empty completion)")
             state["done_sent"] = True
             state["stop"] = True
             yield b"data: [DONE]\n\n"
@@ -437,10 +495,18 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
             estatus, emsg = _classify_upstream_error(frame_err)
             logger.warning("[UPSTREAM ERROR FRAME] %s from %s", emsg, client_ip)
             state["stop"] = True
-            yield _oai_error_sse(emsg, estatus)
-            return
+            raise UpstreamDead(f"{emsg} ({estatus})")
         if _is_junk_frame(frame):
             return
+        scan = _scan_frame(frame)
+        if scan["live"]:
+            state["live"] = True
+        if scan["bad"]:
+            # Console's in-band failure: finish_reason:"network_error" under a
+            # well-formed frame. Aborting (no DONE) is what 9Router reads as a
+            # model failure; a clean end reads as an empty success.
+            state["stop"] = True
+            raise UpstreamDead("no usable content (finish_reason: network_error)")
         if b'"tool_calls"' in frame:
             state["saw_tool"] = True
             state["saw_content"] = True
@@ -486,17 +552,14 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
                 if not state["saw_tool"] and not state["saw_finish"] and not state["saw_usage"]:
                     # Upstream cut the stream before any terminal signal —
                     # mid-response (content was flowing) or all-junk (empty).
-                    # Zen kills long free-tier streams this way; surface an
-                    # error so 9Router retries instead of showing a half (or
-                    # blank) answer as 'success'. Tool-call streams are exempt:
-                    # muse-spark legitimately omits finish_reason for tool
-                    # calls (handled above).
+                    # Zen kills long free-tier streams this way; ABORT the
+                    # connection so 9Router classifies the model as failed
+                    # instead of parsing a clean empty stream as success.
                     logger.warning(
                         "[ZEN] stream ended WITHOUT terminal signal (truncated or empty): content=%s bytes=%d client=%s",
                         state["saw_content"], state["relayed"], client_ip,
                     )
-                    yield _oai_error_sse("Upstream stream ended before completion", 502)
-                    return
+                    raise UpstreamDead("Upstream stream ended before completion")
                 if state["saw_tool"] and not state["saw_finish"]:
                     yield b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
                 yield b"data: [DONE]\n\n"
@@ -732,8 +795,7 @@ async def _keepalive_wrapper(gen: AsyncIterator[bytes], interval: float = 10.0) 
             if isinstance(item, BaseException):
                 if buf:
                     yield buf
-                yield _oai_error_sse(f"Upstream stream failed: {item}")
-                break
+                raise item
             buf += item
             while b"\n\n" in buf:
                 frame, buf = buf.split(b"\n\n", 1)
@@ -747,9 +809,70 @@ async def _keepalive_wrapper(gen: AsyncIterator[bytes], interval: float = 10.0) 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
 
 
+class UpstreamDead(Exception):
+    """Post-commit upstream failure.
+
+    Raised inside the response generator AFTER HTTP 200 was committed, so the
+    connection terminates mid-stream (premature close) instead of delivering a
+    well-formed error frame + [DONE] — which protocol-loose callers like
+    9Router parse as a completed EMPTY success ('succeeded · IN 0 · OUT 0')
+    and never fail over. A transport-level abort is the only signal they
+    classify as a model failure."""
+
+
+async def _relay_openai_chunks(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    async for chunk in _keepalive_wrapper(chunks):
+        yield chunk
+
+
+async def _pending_relay_with_retry(
+    first_task: asyncio.Task,
+    make_task,
+    budget: float,
+    relay_fn,
+    interval: float = 10.0,
+) -> AsyncIterator[bytes]:
+    """Post-commit pending relay with upstream retries.
+
+    The client already has HTTP 200 + keepalives, so a failed upstream attempt
+    no longer needs to abort: start a NEW upstream request and keep feeding
+    keepalives until one succeeds or `budget` seconds elapse (then abort via
+    UpstreamDead so the caller classifies the model as failed)."""
+    deadline = time.monotonic() + budget
+    task = first_task
+    attempt = 0
+    while True:
+        while not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                yield b": keepalive\n\n"
+            except Exception:
+                break
+        try:
+            status, err, chunks = task.result()
+        except Exception as e:
+            err, status, chunks = str(e), 0, None
+        if err is None and chunks is not None:
+            async for chunk in relay_fn(chunks):
+                yield chunk
+            return
+        attempt += 1
+        if time.monotonic() >= deadline:
+            logger.warning("[PENDING] giving up after %d attempt(s): %s (%s)", attempt, err, status)
+            raise UpstreamDead(f"{err} ({status})")
+        logger.warning("[PENDING RETRY] attempt %d failed (%s %s), retrying upstream", attempt, status, err)
+        await asyncio.sleep(1.0)
+        # make_task() returns a coroutine (e.g. `lambda: _zen_stream_upstream(...)`):
+        # wrap it, the loop below needs a Task with .done()/.result().
+        task = asyncio.ensure_future(make_task())
+
+
 async def _relay_from_task(task: asyncio.Task, interval: float = 10.0) -> AsyncIterator[bytes]:
-    """Consume an already-started _zen_stream_upstream task, emitting keepalive
-    comments while it is pending and an SSE error event + [DONE] on failure."""
+    """Consume an already-started _zen_stream_upstream task: keepalive comments
+    while pending; on failure RAISE (abort the committed 200) — never a clean
+    error frame + [DONE], which 9Router parses as an empty success."""
     try:
         while not task.done():
             try:
@@ -763,13 +886,12 @@ async def _relay_from_task(task: asyncio.Task, interval: float = 10.0) -> AsyncI
                 break
         try:
             status, err, chunks = task.result()
-        except Exception as e:
-            logger.warning("[ZEN] upstream exception %s", e)
-            yield _oai_error_sse(str(e))
-            return
+        except Exception:
+            # Upstream died while the client was already on keepalives: abort
+            # (UpstreamDead semantics) instead of a parseable error frame.
+            raise
         if err:
-            yield _oai_error_sse(err, status)
-            return
+            raise UpstreamDead(f"{err} ({status})")
         async for chunk in _keepalive_wrapper(chunks):
             yield chunk
     finally:
@@ -795,7 +917,16 @@ async def _openai_stream_response(url: str, headers: dict, body: dict, client_ip
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=STATUS_HOLD_SECS)
     except asyncio.TimeoutError:
-        return StreamingResponse(_relay_from_task(task), media_type="text/event-stream", headers=_SSE_HEADERS)
+        return StreamingResponse(
+            _pending_relay_with_retry(
+                task,
+                lambda: _zen_stream_upstream(url, headers, body, client_ip),
+                PENDING_RETRY_SECS,
+                _relay_openai_chunks,
+            ),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
     except Exception as e:
         if not task.done():
             task.cancel()
@@ -819,13 +950,10 @@ async def _anthropic_relay_from_task(task: asyncio.Task, model: str, interval: f
                 break
         try:
             status, err, chunks = task.result()
-        except Exception as e:
-            logger.warning("[ZEN] upstream exception %s", e)
-            yield _sse_event("error", {"type": "error", "error": {"type": "api_error", "message": str(e)}})
-            return
+        except Exception:
+            raise
         if err:
-            yield _sse_event("error", {"type": "error", "error": {"type": "rate_limit_error", "message": err}})
-            return
+            raise UpstreamDead(f"{err} ({status})")
         async for chunk in _anthropic_events(chunks, model):
             yield chunk
     finally:
@@ -839,8 +967,18 @@ async def _anthropic_stream_response(url: str, headers: dict, body: dict, client
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=STATUS_HOLD_SECS)
     except asyncio.TimeoutError:
+        async def relay_anth(chunks):
+            async for ev in _anthropic_events(chunks, model):
+                yield ev
         return StreamingResponse(
-            _anthropic_relay_from_task(task, model), media_type="text/event-stream", headers=_SSE_HEADERS
+            _pending_relay_with_retry(
+                task,
+                lambda: _zen_stream_parsed(url, headers, body, client_ip),
+                PENDING_RETRY_SECS,
+                relay_anth,
+            ),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
         )
     except Exception as e:
         if not task.done():
@@ -982,13 +1120,34 @@ async def _zen_stream_parsed(url: str, headers: dict, body: dict, client_ip: str
     Skips [DONE] markers and non-JSON data lines. A FreeUsageLimitError frame
     (even mid-stream) becomes a synthetic rate_limit_error object and ends the
     stream. Returns (200, None, iterator) or (status, detail, None)."""
-    client = _client(timeout=httpx.Timeout(180.0, connect=15.0))
-    try:
-        req = client.build_request("POST", url, headers=headers, json=body)
-        resp = await client.send(req, stream=True)
-    except BaseException:
-        await client.aclose()
-        raise
+    attempt = 0
+    while True:
+        client = _client(timeout=httpx.Timeout(180.0, connect=15.0))
+        try:
+            req = client.build_request("POST", url, headers=headers, json=body)
+            resp = await client.send(req, stream=True)
+        except httpx.TransportError:
+            await client.aclose()
+            if attempt < UPSTREAM_RETRIES:
+                attempt += 1
+                delay = UPSTREAM_RETRY_BACKOFF * (2 ** (attempt - 1))
+                logger.warning("[RETRY] upstream transport error, attempt %d/%d in %.1fs", attempt, UPSTREAM_RETRIES + 1, delay)
+                await asyncio.sleep(delay)
+                continue
+            raise
+        except BaseException:
+            await client.aclose()
+            raise
+        if resp.status_code in _RETRYABLE_STATUSES and attempt < UPSTREAM_RETRIES:
+            await resp.aread()
+            await resp.aclose()
+            await client.aclose()
+            attempt += 1
+            delay = UPSTREAM_RETRY_BACKOFF * (2 ** (attempt - 1))
+            logger.warning("[RETRY] upstream %s, attempt %d/%d in %.1fs", resp.status_code, attempt, UPSTREAM_RETRIES + 1, delay)
+            await asyncio.sleep(delay)
+            continue
+        break
     if resp.status_code != 200:
         raw = await resp.aread()
         await resp.aclose()
@@ -1028,28 +1187,19 @@ async def _zen_stream_parsed(url: str, headers: dict, body: dict, client_ip: str
                 yield obj
 
     def _emit(obj: dict):
-        """Return an error-dict for upstream error frames, else None."""
+        """Raise UpstreamDead on upstream error frames; else None."""
         err_obj = obj.get("error") if isinstance(obj.get("error"), dict) else None
         if err_obj is not None or obj.get("type") == "error":
             estatus, emsg = _classify_upstream_error(err_obj or {})
             logger.warning("[UPSTREAM ERROR FRAME] %s from %s", emsg, client_ip)
-            return {
-                "type": "error",
-                "error": {
-                    "type": "rate_limit_error" if estatus == 429 else "api_error",
-                    "message": emsg,
-                },
-            }
+            raise UpstreamDead(f"{emsg} ({estatus})")
         return None
 
     async def gen():
         try:
             for frame in buffered:
                 for obj in _parse_objs(frame):
-                    err = _emit(obj)
-                    if err is not None:
-                        yield err
-                        return
+                    _emit(obj)
                     yield obj
             if live_q is None:
                 return
@@ -1060,16 +1210,282 @@ async def _zen_stream_parsed(url: str, headers: dict, body: dict, client_ip: str
                 if isinstance(item, BaseException):
                     raise item
                 for obj in _parse_objs(item):
-                    err = _emit(obj)
-                    if err is not None:
-                        yield err
-                        return
+                    _emit(obj)
                     yield obj
         finally:
             await resp.aclose()
             await client.aclose()
 
     return 200, None, gen()
+
+
+# --- Responses API bridge (muse-spark) ---
+# zen's /chat/completions returns 500 for muse-spark (Console), while
+# /responses works — the opencode CLI itself talks the Responses API for this
+# model. 9Router only speaks chat/completions, so we translate both ways.
+
+RESPONSES_MODELS = {"muse-spark-1.2-contributor-free"}
+
+
+def _chat_to_responses(body: dict) -> dict:
+    """Translate an OpenAI chat.completions request into a Responses request."""
+    instructions: list[str] = []
+    input_items: list[dict] = []
+    for msg in body.get("messages", []):
+        role = msg.get("role")
+        content = msg.get("content")
+        if role in ("system", "developer"):
+            text = content if isinstance(content, str) else "".join(
+                b.get("text", "") for b in content or [] if isinstance(b, dict)
+            )
+            if text:
+                instructions.append(text)
+            continue
+        if role == "tool":
+            output = content if isinstance(content, str) else json.dumps(content)
+            input_items.append({"type": "function_call_output", "call_id": msg.get("tool_call_id", ""), "output": output})
+            continue
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "{}"),
+                })
+            text = content if isinstance(content, str) else "".join(
+                b.get("text", "") for b in content or [] if isinstance(b, dict)
+            )
+            if text:
+                input_items.append({"role": "assistant", "content": [{"type": "output_text", "text": text}]})
+            continue
+        # user
+        if isinstance(content, str):
+            input_items.append({"role": "user", "content": [{"type": "input_text", "text": content}]})
+        else:
+            parts = []
+            for b in content or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text":
+                    parts.append({"type": "input_text", "text": b.get("text", "")})
+                elif b.get("type") == "image_url":
+                    u = (b.get("image_url") or {}).get("url", "")
+                    if u.startswith("data:"):
+                        parts.append({"type": "input_image", "image_url": u})
+                    elif u:
+                        parts.append({"type": "input_image", "image_url": u})
+            if parts:
+                input_items.append({"role": "user", "content": parts})
+
+    tools_out = []
+    for t in body.get("tools") or []:
+        if isinstance(t, dict) and t.get("type") == "function":
+            fn = t.get("function") or {}
+            tools_out.append({
+                "type": "function",
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+            })
+
+    out: dict = {"model": body.get("model"), "input": input_items, "stream": bool(body.get("stream"))}
+    if instructions:
+        out["instructions"] = "\n\n".join(instructions)
+    mt = body.get("max_tokens")
+    if mt:
+        # muse-spark runs reasoning effort=high before answering; a small
+        # max_output_tokens is consumed by reasoning alone → response.incomplete
+        # with zero text (the CLI never sets one). Give it headroom.
+        out["max_output_tokens"] = max(int(mt), 2048)
+    if body.get("temperature") is not None:
+        out["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        out["top_p"] = body["top_p"]
+    if tools_out:
+        out["tools"] = tools_out
+    tc = body.get("tool_choice")
+    if isinstance(tc, str) and tc in ("auto", "required", "none"):
+        out["tool_choice"] = tc
+    elif isinstance(tc, dict):
+        if tc.get("type") == "function":
+            out["tool_choice"] = {"type": "function", "name": (tc.get("function") or {}).get("name", "")}
+        elif tc.get("type") in ("auto", "required", "none"):
+            out["tool_choice"] = tc.get("type")
+    return out
+
+
+def _map_responses_usage(rusage: dict) -> dict:
+    return {
+        "prompt_tokens": rusage.get("input_tokens", 0),
+        "completion_tokens": rusage.get("output_tokens", 0),
+        "total_tokens": rusage.get("total_tokens", 0),
+    }
+
+
+async def _responses_events_to_chat(events: AsyncIterator[dict]) -> AsyncIterator[bytes]:
+    """Translate parsed Responses-API events into chat.completion.chunk SSE."""
+    state = {"role_sent": False, "tool_idx": 0, "saw_call": False, "finish": None, "usage": None, "emitted": False}
+
+    def chunk(delta: Optional[dict] = None, finish: Optional[str] = None, usage: Optional[dict] = None, role: bool = False) -> bytes:
+        d: dict = {}
+        if role:
+            d["role"] = "assistant"
+        if delta:
+            d.update(delta)
+        choice: dict = {"index": 0, "delta": d}
+        if finish:
+            choice["finish_reason"] = finish
+        frame: dict = {
+            "id": _gen_id("chatcmpl"),
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "choices": [choice],
+        }
+        if usage is not None:
+            frame["usage"] = usage
+        return f"data: {json.dumps(frame, separators=(',', ':'))}\n\n".encode()
+
+    async for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        t = ev.get("type", "")
+        if t == "response.output_text.delta":
+            state["emitted"] = True
+            if not state["role_sent"]:
+                state["role_sent"] = True
+                yield chunk(role=True)
+            yield chunk(delta={"content": ev.get("delta", "")})
+        elif t in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta"):
+            state["emitted"] = True
+            if not state["role_sent"]:
+                state["role_sent"] = True
+                yield chunk(role=True)
+            yield chunk(delta={"reasoning_content": ev.get("delta", "")})
+        elif t == "response.function_call_arguments.delta":
+            yield chunk(delta={"tool_calls": [{"index": state["tool_idx"] - 1, "function": {"arguments": ev.get("delta", "")}}]})
+        elif t == "response.output_item.added":
+            item = ev.get("item") or {}
+            if item.get("type") == "message" and not state["role_sent"]:
+                state["role_sent"] = True
+                yield chunk(role=True)
+            elif item.get("type") == "function_call":
+                state["saw_call"] = True
+                state["emitted"] = True
+                yield chunk(delta={"tool_calls": [{
+                    "index": state["tool_idx"],
+                    "id": item.get("call_id") or _gen_id("call"),
+                    "type": "function",
+                    "function": {"name": item.get("name", ""), "arguments": ""},
+                }]})
+                state["tool_idx"] += 1
+        elif t == "response.completed":
+            resp = ev.get("response") or {}
+            state["usage"] = _map_responses_usage(resp.get("usage") or {})
+            state["finish"] = "tool_calls" if state["saw_call"] else "stop"
+        elif t == "response.incomplete":
+            resp = ev.get("response") or {}
+            state["usage"] = _map_responses_usage(resp.get("usage") or {})
+            state["finish"] = "tool_calls" if state["saw_call"] else "length"
+        elif t == "response.failed":
+            rerr = (ev.get("response") or {}).get("error") or {}
+            raise UpstreamDead(str(rerr.get("message") or "Upstream error"))
+        elif t == "error":
+            err = ev.get("error")
+            _, emsg = _classify_upstream_error(err if isinstance(err, dict) else {})
+            raise UpstreamDead(emsg)
+        # created/in_progress/queued/ping/content_part.*/output_item.done → skip
+    if state["finish"] is None and state["usage"] is None:
+        # No terminal event — upstream cut the stream mid-flight: abort.
+        raise UpstreamDead("Upstream stream ended before completion")
+    if not state["emitted"]:
+        # Terminal without any output (reasoning-only budget burn): abort.
+        raise UpstreamDead("no usable content (empty completion)")
+    yield chunk(finish=state["finish"] or "stop", usage=state["usage"])
+    yield b"data: [DONE]\n\n"
+
+
+def _responses_to_chat_json(resp_obj: dict, model: str) -> dict:
+    """Translate a non-streaming Responses object into chat.completions JSON."""
+    text_parts: list[str] = []
+    tool_calls = []
+    for item in resp_obj.get("output") or []:
+        it = item.get("type")
+        if it == "message":
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    text_parts.append(part.get("text", ""))
+        elif it == "function_call":
+            tool_calls.append({
+                "id": item.get("call_id") or _gen_id("call"),
+                "type": "function",
+                "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")},
+            })
+    message: dict = {"role": "assistant", "content": "".join(text_parts) or None}
+    finish = "tool_calls" if tool_calls else ("length" if resp_obj.get("status") == "incomplete" else "stop")
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return {
+        "id": resp_obj.get("id") or _gen_id("chatcmpl"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+        "usage": _map_responses_usage(resp_obj.get("usage") or {}),
+    }
+
+
+async def _chat_via_responses(headers: dict, body: dict, client_ip: str):
+    """Serve a chat.completions request for a RESPONSES_MODELS model by calling
+    zen's /responses endpoint and translating back."""
+    rbody = _chat_to_responses(body)
+    url = f"{BASE_URL}/responses"
+
+    if rbody.get("stream"):
+        task = asyncio.create_task(_zen_stream_parsed(url, headers, rbody, client_ip))
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=STATUS_HOLD_SECS)
+        except asyncio.TimeoutError:
+            async def relay_rsp(chunks):
+                async for out in _responses_events_to_chat(chunks):
+                    yield out
+            return StreamingResponse(
+                _pending_relay_with_retry(
+                    task,
+                    lambda: _zen_stream_parsed(url, headers, rbody, client_ip),
+                    PENDING_RETRY_SECS,
+                    relay_rsp,
+                ),
+                media_type="text/event-stream",
+                headers=_SSE_HEADERS,
+            )
+        except Exception as e:
+            if not task.done():
+                task.cancel()
+            raise HTTPException(502, f"Upstream error: {e}")
+        status, err, chunks = task.result()
+        if err:
+            raise HTTPException(status or 502, err)
+        return StreamingResponse(
+            _keepalive_wrapper(_responses_events_to_chat(chunks)),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+    async with _client(timeout=httpx.Timeout(180.0, connect=15.0)) as client:
+        resp = await client.post(url, headers=headers, json=rbody)
+    if resp.status_code != 200:
+        logger.warning("[ZEN] status=%s body=%s", resp.status_code, resp.text[:300])
+        rl = _is_rate_limit_error(resp.status_code, resp.content)
+        if rl:
+            raise HTTPException(429, f"Rate limit: {rl}")
+        raise HTTPException(resp.status_code, f"Upstream error: {resp.text[:200]}")
+    out = _responses_to_chat_json(_safe_json(resp), body.get("model"))
+    choice = out["choices"][0]
+    if not choice["message"].get("content") and not choice["message"].get("tool_calls") and out["usage"]["completion_tokens"] == 0:
+        raise HTTPException(502, "no usable content (empty completion)")
+    return out
 
 
 # --- Routes ---
@@ -1106,6 +1522,35 @@ def _safe_json(resp: httpx.Response):
         raise HTTPException(502, "Upstream returned a non-JSON body")
 
 
+async def _post_with_retry(url: str, headers: dict, json_body: dict) -> httpx.Response:
+    """POST with transient-failure retry (502/503/504/connect errors). The
+    response body is fully read before returning, so each attempt's client is
+    closed and only the final response escapes."""
+    attempt = 0
+    while True:
+        client = _client(timeout=httpx.Timeout(180.0, connect=15.0))
+        try:
+            resp = await client.post(url, headers=headers, json=json_body)
+            _ = resp.content  # force read so this attempt's client can close
+            await client.aclose()
+        except httpx.TransportError:
+            await client.aclose()
+            if attempt < UPSTREAM_RETRIES:
+                attempt += 1
+                delay = UPSTREAM_RETRY_BACKOFF * (2 ** (attempt - 1))
+                logger.warning("[RETRY] upstream transport error, attempt %d/%d in %.1fs", attempt, UPSTREAM_RETRIES + 1, delay)
+                await asyncio.sleep(delay)
+                continue
+            raise
+        if resp.status_code in _RETRYABLE_STATUSES and attempt < UPSTREAM_RETRIES:
+            attempt += 1
+            delay = UPSTREAM_RETRY_BACKOFF * (2 ** (attempt - 1))
+            logger.warning("[RETRY] upstream %s, attempt %d/%d in %.1fs", resp.status_code, attempt, UPSTREAM_RETRIES + 1, delay)
+            await asyncio.sleep(delay)
+            continue
+        return resp
+
+
 @app.get("/v1/models")
 async def list_models():
     if BROKE_MODE:
@@ -1134,11 +1579,13 @@ async def chat_completions(request: Request):
 
     url = f"{BASE_URL}/chat/completions"
 
+    if body.get("model") in RESPONSES_MODELS:
+        return await _chat_via_responses(headers, body, ip)
+
     if stream:
         return await _openai_stream_response(url, headers, body, ip)
 
-    async with _client(timeout=httpx.Timeout(180.0, connect=15.0)) as client:
-        resp = await client.post(url, headers=headers, json=body)
+    resp = await _post_with_retry(url, headers, body)
 
     if resp.status_code != 200:
         logger.warning("[ZEN] status=%s body=%s", resp.status_code, resp.text[:300])
@@ -1169,8 +1616,7 @@ async def anthropic_messages(request: Request):
         oai_body["stream"] = True
         return await _anthropic_stream_response(url, headers, oai_body, ip, model)
 
-    async with _client(timeout=httpx.Timeout(180.0, connect=15.0)) as client:
-        resp = await client.post(url, headers=headers, json=oai_body)
+    resp = await _post_with_retry(url, headers, oai_body)
 
     if resp.status_code != 200:
         logger.warning("[ZEN] status=%s body=%s", resp.status_code, resp.text[:300])
