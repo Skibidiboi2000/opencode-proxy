@@ -3,3 +3,8 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .mimosa/
+
+# Agent tooling state — local-only, never committed.
+.cursor/
+.opencode/
+*.log

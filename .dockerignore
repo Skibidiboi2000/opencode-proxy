@@ -1,0 +1,16 @@
+# Keep the build context small: only requirements.txt, proxy.py,
+# harness_tools.json and entrypoint.sh are copied into the image.
+# harness_tools.json is NOT optional — proxy.py opens it at import time.
+.git/
+.gitignore
+.dockerignore
+.opencode/
+.cursor/
+.mimosa/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+test_proxy.py
+README.md

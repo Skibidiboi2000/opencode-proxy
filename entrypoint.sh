@@ -1,9 +1,9 @@
 #!/bin/sh
 set -e
 
-echo "Starting OpenCode Proxy v1.5.0 on 0.0.0.0:5381"
+VERSION="$(python3 -c 'import proxy; print(proxy.VERSION)' 2>/dev/null || echo dev)"
+echo "Starting OpenCode Proxy v${VERSION} on 0.0.0.0:5381"
 echo "Backend: $OPENCODE_BASE_URL"
-echo "Broke mode: $OPENCODE_BROKE"
 echo "Endpoints:"
 echo "  OpenAI:    POST /v1/chat/completions"
 echo "  Anthropic: POST /v1/messages"
