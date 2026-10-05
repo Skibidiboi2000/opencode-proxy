@@ -357,13 +357,18 @@ def _tool_call_autocorrector(name_map: dict):
 
 
 
-def _client_tool_names_lower(tools, anthropic: bool) -> set:
-    """Lower-cased names of the client's own advertised tools.
+def _client_tool_names(tools, anthropic: bool) -> set:
+    """The client's own advertised tool names, EXACTLY as written.
 
-    Collision detection is case-INsensitive: the model may emit any casing
-    (`bash`, `Read`) and an upper-case client definition plus its lower-case
-    harness twin would present upstream with two tools that differ only by
-    case, inviting a call the client cannot execute.
+    Collision detection is case-SENSITIVE on purpose. Zen's free tier only
+    serves requests carrying the genuine 13-tool harness set, and it counts
+    specific definitions, not merely a tool count. Dedupe used to fold case,
+    so a client advertising `Read`/`Write`/`Bash` suppressed the padded
+    `read`/`write`/`bash` and upstream saw a 6-tool remainder -> 403
+    FreeTierError (live 2026-09-30 on oc-mimo-v2.6-flash-free via ZCode).
+    Case-variant twins are safe to send: _client_tool_name_map +
+    _autocorrect_tool_calls_json rewrite a model-emitted `read` back to the
+    client's `Read` on the way out.
     """
     names: set = set()
     for t in tools or []:
@@ -371,7 +376,7 @@ def _client_tool_names_lower(tools, anthropic: bool) -> set:
             continue
         name = t.get("name") if anthropic else ((t.get("function") or {}).get("name"))
         if isinstance(name, str) and name:
-            names.add(name.lower())
+            names.add(name)
     return names
 
 
@@ -387,9 +392,9 @@ def _pad_harness_tools(body: dict) -> dict:
     """
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         return body
-    have = _client_tool_names_lower(body.get("tools"), anthropic=False)
+    have = _client_tool_names(body.get("tools"), anthropic=False)
     missing = [_ignore_oai(t) for t in _HARNESS_TOOLS
-               if t["function"]["name"].lower() not in have]
+               if t["function"]["name"] not in have]
     if not missing:
         return body
     out = dict(body)
@@ -406,13 +411,13 @@ def _pad_harness_tools_anthropic(mbody: dict) -> dict:
     """Anthropic-format ({name, description, input_schema}) counterpart."""
     if not isinstance(mbody, dict) or not isinstance(mbody.get("messages"), list):
         return mbody
-    have = _client_tool_names_lower(mbody.get("tools"), anthropic=True)
+    have = _client_tool_names(mbody.get("tools"), anthropic=True)
     missing = [
         {"name": t["function"]["name"],
          "description": f"{_HARNESS_IGNORE_NOTE} {t['function'].get('description') or ''}".strip(),
          "input_schema": t["function"].get("parameters") or {"type": "object", "properties": {}}}
         for t in _HARNESS_TOOLS
-        if t["function"]["name"].lower() not in have
+        if t["function"]["name"] not in have
     ]
     if not missing:
         return mbody
@@ -425,13 +430,13 @@ def _pad_harness_tools_responses(rbody: dict) -> dict:
     """Responses-format ({type: function, name, ...}) counterpart."""
     if not isinstance(rbody, dict):
         return rbody
-    have = _client_tool_names_lower(rbody.get("tools"), anthropic=True)
+    have = _client_tool_names(rbody.get("tools"), anthropic=True)
     missing = [
         {"type": "function", "name": t["function"]["name"],
          "description": f"{_HARNESS_IGNORE_NOTE} {t['function'].get('description') or ''}".strip(),
          "parameters": t["function"].get("parameters") or {"type": "object", "properties": {}}}
         for t in _HARNESS_TOOLS
-        if t["function"]["name"].lower() not in have
+        if t["function"]["name"] not in have
     ]
     if not missing:
         return rbody
