@@ -11,6 +11,6 @@ RUN chmod +x /entrypoint.sh
 
 EXPOSE 5381
 
-ENV OPENCODE_BASE_URL=https://opencode.ai/zen/v1
+ENV OPENCODE_BASE_URL=https://opencode.ai/inference/v1
 
 ENTRYPOINT ["/entrypoint.sh"]

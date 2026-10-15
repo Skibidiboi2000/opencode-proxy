@@ -63,7 +63,7 @@ response is delivered.
 
 | Env | Default | Purpose |
 |---|---|---|
-| `OPENCODE_BASE_URL` | `https://opencode.ai/zen/v1` | Zen upstream. Validated at import against an SSRF guard (http/https only, never loopback/private/reserved). |
+| `OPENCODE_BASE_URL` | `https://opencode.ai/inference/v1` | Upstream. Validated at import against an SSRF guard (http/https only, never loopback/private/reserved). `zen/v1` is a newer endpoint that requires an account key; `inference/v1` serves the anonymous free tier (`Bearer public`). |
 | `OPENCODE_SESSION` | – | Optional session id (`ses_…`) sent as `x-opencode-session`. Does not affect reachability. |
 | `MODELS_REFRESH_SECS` | `300` | Background discovery refresh interval |
 | `MODELS_TTL_SECS` | `900` | Age at which a cached inventory counts as stale |

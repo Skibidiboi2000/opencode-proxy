@@ -16,71 +16,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# #region agent log
-_DBG_PATH = os.environ.get(
-    "DBG_LOG_PATH", "/Users/khangdeptrai/docker/opencode-proxy/.cursor/debug-3ef755.log"
-)
-_DBG_SID = "3ef755"
 
-
-def _dbg(location: str, message: str, data: dict) -> None:
-    import json as _json
-    import time as _time
-
-    try:
-        payload = {
-            "sessionId": _DBG_SID,
-            "runId": os.environ.get("DBG_RUN", "pre-fix"),
-            "timestamp": int(_time.time() * 1000),
-            "location": location,
-            "message": message,
-            "data": data,
-        }
-        with open(_DBG_PATH, "a") as fh:
-            fh.write(_json.dumps(payload, default=str) + "\n")
-            fh.flush()
-    except Exception as _e:
-        # never let instrumentation break the request path, but make a failed
-        # write visible instead of silently losing every log line
-        logging.getLogger("opencode-proxy").warning(
-            "[DBG] log write failed path=%s err=%r", _DBG_PATH, _e
-        )
-# #endregion
-
-# #region agent log
-# Relative to the app dir so the same default works on the host and inside the
-# container (where the app lives at /app, not the host path).
-_DBG02_PATH = os.environ.get(
-    "DBG_LOG_PATH_02B13A",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug-02b13a.log"),
-)
-_DBG02_SID = "02b13a"
-
-
-def _dbg02(location: str, message: str, data: dict) -> None:
-    try:
-        payload = {
-            "sessionId": _DBG02_SID,
-            "runId": os.environ.get("DBG_RUN", "pre-fix"),
-            "timestamp": int(time.time() * 1000),
-            "location": location,
-            "message": message,
-            "data": data,
-        }
-        with open(_DBG02_PATH, "a") as fh:
-            fh.write(json.dumps(payload, default=str) + "\n")
-    except Exception as _e:
-        logging.getLogger("opencode-proxy").warning(
-            "[DBG02] log write failed path=%s err=%r", _DBG02_PATH, _e
-        )
-# #endregion
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("opencode-proxy")
 
 VERSION = "1.14.0"
 OC_VERSION = "2.0.11"
-BASE_URL = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/zen/v1")
+BASE_URL = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/inference/v1")
 
 # Server-side requests must be http/https only, and never reach loopback,
 # private, or reserved addresses (SSRF guard). Applied to the configured
@@ -399,11 +342,6 @@ def _pad_harness_tools(body: dict) -> dict:
         return body
     out = dict(body)
     out["tools"] = list(body.get("tools") or []) + missing
-    # #region agent log
-    _dbg("proxy.py:_pad_harness_tools:exit", "H1 harness pad appended client-shape tools",
-         {"hypothesisId": "H1", "injected": len(missing), "total_tools": len(out["tools"]),
-          "client_tool_choice": body.get("tool_choice"), "client_tools": sorted(have)[:12]})
-    # #endregion
     return out
 
 
@@ -623,8 +561,9 @@ def _make_headers(session_id: str) -> dict[str, str]:
         "User-Agent": f"opencode/{OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.2",
         "x-opencode-client": "cli",
         "x-opencode-project": "global",
-        "x-opencode-request": _gen_id("msg"),
         "x-opencode-session": session_id,
+        "x-opencode-session-id": session_id,
+        "x-session-id": session_id,
     }
 
 
@@ -862,15 +801,6 @@ async def _probe_sse_stream(resp, client, hold_secs: float) -> tuple[Optional[tu
         timed_out = True
 
     if timed_out or st["live"]:
-        # #region agent log
-        if buffered:
-            _dbg02("proxy.py:_probe_sse_stream:return",
-                   "H2/H3 probe buffered terminal frames the relay will not credit",
-                   {"hypothesisId": "H2,H3", "timed_out": timed_out, "live": st["live"],
-                    "done": st["done"], "err": bool(st["err"]), "bad": st["bad"],
-                    "n_buffered": len(buffered),
-                    "buffered_first_200": [b[:200] for b in buffered[:3]]})
-        # #endregion
         return None, buffered, queue
 
     # Dead stream: stop the producer and release the connection.
@@ -960,14 +890,6 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
 
     name_map = _client_tool_name_map(body)
     autocorrect = _tool_call_autocorrector(name_map)
-    # #region agent log
-    _dbg02("proxy.py:_zen_stream_upstream:post-probe",
-           "H1/H2/H3 state entering the relay after the probe",
-           {"hypothesisId": "H1,H2,H3",
-            "n_buffered": len(buffered),
-            "buffered_first_200": [b[:200] for b in buffered[:3]],
-            "n_name_map": len(name_map)})
-    # #endregion
     state = {
         "saw_tool": False,
         "saw_finish": False,
@@ -1100,17 +1022,6 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
             # finish_reason + [DONE] for tool calls (it emits usage/cost instead).
             # Without them the harness reports "Tool call ended without a terminal event."
             if not state["done_sent"]:
-                # #region agent log
-                _dbg02("proxy.py:_zen_stream_upstream:no-done",
-                       "H1 raw relay reached EOF without a [DONE] frame",
-                       {"hypothesisId": "H1",
-                        "n_buffered": len(buffered),
-                        "relay_saw_finish": state["saw_finish"],
-                        "relay_saw_usage": state["saw_usage"],
-                        "relay_saw_tool": state["saw_tool"],
-                        "relay_saw_content": state["saw_content"],
-                        "relay_bytes": state["relayed"]})
-                # #endregion
                 logger.info(
                     "[ZEN] stream ended without DONE: finish=%s usage=%s tool=%s content=%s reasoning=%s bytes=%d client=%s",
                     state["saw_finish"], state["saw_usage"], state["saw_tool"], state["saw_content"], state["saw_reasoning"], state["relayed"], client_ip,
@@ -1990,11 +1901,6 @@ async def _responses_events_to_chat(events: AsyncIterator[dict]) -> AsyncIterato
         # created/in_progress/queued/ping/content_part.*/output_item.done → skip
     if state["finish"] is None and state["usage"] is None:
         # No terminal event — upstream cut the stream mid-flight: abort.
-        # #region agent log
-        _dbg02("proxy.py:_responses_events_to_chat:no-terminal",
-               "H1b Responses bridge aborted despite a possibly probe-buffered terminal",
-               {"hypothesisId": "H1b", "emitted": state["emitted"]})
-        # #endregion
         raise UpstreamDead("Upstream stream ended before completion")
     if not state["emitted"]:
         # Terminal without any output (reasoning-only budget burn): abort.
@@ -2031,6 +1937,70 @@ def _responses_to_chat_json(resp_obj: dict, model: str) -> dict:
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "usage": _map_responses_usage(resp_obj.get("usage") or {}),
     }
+
+
+async def _collect_chat_json(chunks: AsyncIterator[bytes], model: str) -> dict:
+    """Assemble a non-streaming chat.completions object from an SSE byte stream.
+
+    inference/v1 rejects `stream:false` upstream (403), so the non-streaming
+    routes always stream upstream and assemble here. Merges delta.content and
+    delta.tool_calls (by index), plus finish_reason and usage."""
+    content_parts: list[str] = []
+    calls: dict[int, dict] = {}
+    finish: Optional[str] = None
+    usage: Optional[dict] = None
+    msg_id = _gen_id("chatcmpl")
+    async for frame in chunks:
+        for line in frame.split(b"\n"):
+            if not line.startswith(b"data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if isinstance(obj.get("id"), str):
+                msg_id = obj["id"]
+            for ch in obj.get("choices") or []:
+                d = ch.get("delta") or {}
+                if isinstance(d.get("content"), str):
+                    content_parts.append(d["content"])
+                for tc in d.get("tool_calls") or []:
+                    slot = calls.setdefault(tc.get("index", 0), {"id": None, "name": "", "args": []})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if isinstance(fn.get("arguments"), str):
+                        slot["args"].append(fn["arguments"])
+                if ch.get("finish_reason"):
+                    finish = ch["finish_reason"]
+            if isinstance(obj.get("usage"), dict):
+                usage = obj["usage"]
+    message: dict = {"role": "assistant", "content": "".join(content_parts) or None}
+    tool_calls = [{
+        "id": s["id"] or _gen_id("call"),
+        "type": "function",
+        "function": {"name": s["name"], "arguments": "".join(s["args"])},
+    } for _, s in sorted(calls.items()) if s["name"]]
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        finish = finish or "tool_calls"
+    out: dict = {
+        "id": msg_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}],
+    }
+    if usage:
+        out["usage"] = usage
+    return out
 
 
 async def _chat_via_responses(headers: dict, body: dict, client_ip: str):
@@ -2070,15 +2040,24 @@ async def _chat_via_responses(headers: dict, body: dict, client_ip: str):
             headers=_SSE_HEADERS,
         )
 
-    async with _client(timeout=httpx.Timeout(180.0, connect=15.0)) as client:
-        resp = await client.post(url, headers=headers, json=rbody)
-    if resp.status_code != 200:
-        logger.warning("[ZEN] status=%s body=%s", resp.status_code, resp.text[:300])
-        rl = _is_rate_limit_error(resp.status_code, resp.content)
-        if rl:
-            raise HTTPException(429, f"Rate limit: {rl}")
-        raise HTTPException(resp.status_code, f"Upstream error: {resp.text[:200]}")
-    out = _responses_to_chat_json(_autocorrect_tool_calls_json(_safe_json(resp), _client_tool_name_map(body)), body.get("model"))
+    # inference/v1 rejects stream:false upstream: stream upstream and assemble
+    # a non-streaming response for the caller.
+    rbody["stream"] = True
+    status, detail, chunks = await _zen_stream_parsed(url, headers, rbody, client_ip)
+    if chunks is None:
+        if status == 429:
+            raise HTTPException(429, f"Rate limit: {detail}")
+        raise HTTPException(status, f"Upstream error: {detail}")
+    resp_obj: Optional[dict] = None
+    try:
+        async for ev in chunks:
+            if isinstance(ev, dict) and ev.get("type") in ("response.completed", "response.incomplete"):
+                resp_obj = ev.get("response") or {}
+    except UpstreamDead as e:
+        raise HTTPException(502, f"Upstream error: {e}")
+    if not resp_obj:
+        raise HTTPException(502, "Upstream error: no completed response (200)")
+    out = _responses_to_chat_json(_autocorrect_tool_calls_json(resp_obj, _client_tool_name_map(body)), body.get("model"))
     choice = out["choices"][0]
     if not choice["message"].get("content") and not choice["message"].get("tool_calls") and out["usage"]["completion_tokens"] == 0:
         raise HTTPException(502, "no usable content (empty completion)")
@@ -2526,14 +2505,6 @@ async def list_models():
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await _json_body(request)
-    # #region agent log
-    _dbg("proxy.py:chat_completions:entry", "H1/H2/H3 request arrived",
-         {"hypothesisId": "H1,H2,H3", "stream": body.get("stream"),
-          "has_tool_choice": "tool_choice" in body,
-          "n_tools": len(body.get("tools") or []),
-          "tool_names": [((t.get("function") or {}).get("name") or t.get("name"))
-                         for t in (body.get("tools") or []) if isinstance(t, dict)][:20]})
-    # #endregion
     body = _fit_context(body)
     body = _pad_harness_tools(body)
     ip = _get_client_ip(request)
@@ -2559,24 +2530,19 @@ async def chat_completions(request: Request):
     if stream:
         return await _openai_stream_response(url, headers, body, ip)
 
-    resp = await _post_with_retry(url, headers, body)
-
-    if resp.status_code != 200:
-        logger.warning("[ZEN] status=%s body=%s", resp.status_code, resp.text[:300])
-        rl = _is_rate_limit_error(resp.status_code, resp.content)
-        if rl:
-            raise HTTPException(429, f"Rate limit: {rl}")
-        raise HTTPException(resp.status_code, f"Upstream error: {resp.text[:200]}")
-
-    out = _autocorrect_tool_calls_json(_safe_json(resp), _client_tool_name_map(body))
-    # #region agent log
-    _dbg("proxy.py:chat_completions:nonstream-exit", "H2/H3 name map from POST-PAD body",
-         {"hypothesisId": "H2,H3", "name_map": _client_tool_name_map(body),
-          "n_map": len(_client_tool_name_map(body)),
-          "emitted_names": [((tc.get("function") or {}).get("name"))
-                            for ch in (out.get("choices") or [])
-                            for tc in ((ch.get("message") or {}).get("tool_calls") or [])]})
-    # #endregion
+    # inference/v1 rejects stream:false upstream: stream upstream and assemble
+    # a non-streaming response for the caller.
+    body["stream"] = True
+    status, detail, chunks = await _zen_stream_upstream(url, headers, body, ip)
+    if chunks is None:
+        if status == 429:
+            raise HTTPException(429, f"Rate limit: {detail}")
+        raise HTTPException(status, f"Upstream error: {detail}")
+    try:
+        out = await _collect_chat_json(chunks, body.get("model", "?"))
+    except UpstreamDead as e:
+        raise HTTPException(502, f"Upstream error: {e}")
+    out = _autocorrect_tool_calls_json(out, _client_tool_name_map(body))
     _reject_empty_completion((out.get("choices") or [{}])[0])
     return out
 
@@ -2584,14 +2550,6 @@ async def chat_completions(request: Request):
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     body = await _json_body(request)
-    # #region agent log
-    _dbg("proxy.py:anthropic_messages:entry", "H2/H3 Anthropic request arrived",
-         {"hypothesisId": "H2,H3", "stream": body.get("stream"),
-          "has_tool_choice": "tool_choice" in body,
-          "n_tools": len(body.get("tools") or []),
-          "tool_names": [t.get("name") for t in (body.get("tools") or [])
-                         if isinstance(t, dict)][:20]})
-    # #endregion
     ip = _get_client_ip(request)
     session = _get_session(ip)
     stream = body.get("stream", False)
@@ -2603,16 +2561,6 @@ async def anthropic_messages(request: Request):
     oai_body = _anthropic_to_openai(body)
     oai_body = _fit_context(oai_body)
     oai_body = _pad_harness_tools(oai_body)
-    # #region agent log
-    _dbg("proxy.py:anthropic_messages:post-pad", "H2/H3/H5/H7 name map after translation+padding",
-         {"hypothesisId": "H2,H3,H5,H7",
-          "map_from_raw_body": _client_tool_name_map(body),
-          "map_from_padded_oai": _client_tool_name_map(oai_body),
-          "n_map_padded": len(_client_tool_name_map(oai_body)),
-          "n_tools": len(oai_body.get("tools") or []),
-          "tool_choice_sent_upstream": oai_body.get("tool_choice"),
-          "tool_choice_in_request": body.get("tool_choice")})
-    # #endregion
     url = f"{base}/chat/completions"
 
     if model in MESSAGES_MODELS:
@@ -2636,24 +2584,18 @@ async def anthropic_messages(request: Request):
         oai_body["stream"] = True
         return await _anthropic_stream_response(url, headers, oai_body, ip, model)
 
-    resp = await _post_with_retry(url, headers, oai_body)
-
-    if resp.status_code != 200:
-        logger.warning("[ZEN] status=%s body=%s", resp.status_code, resp.text[:300])
-        rl = _is_rate_limit_error(resp.status_code, resp.content)
-        if rl:
-            raise HTTPException(429, f"Rate limit: {rl}")
-        raise HTTPException(resp.status_code, f"Upstream error: {resp.text[:200]}")
-
-    out = _autocorrect_tool_calls_json(_safe_json(resp), _client_tool_name_map(oai_body))
-    # #region agent log
-    _dbg("proxy.py:anthropic_messages:nonstream-exit", "H2/H3/H5 native path name map source",
-         {"hypothesisId": "H2,H3,H5", "n_map_padded": len(_client_tool_name_map(oai_body)),
-          "n_map_raw": len(_client_tool_name_map(body)),
-          "emitted_names": [((tc.get("function") or {}).get("name"))
-                            for ch in (out.get("choices") or [])
-                            for tc in ((ch.get("message") or {}).get("tool_calls") or [])]})
-    # #endregion
+    # inference/v1 rejects stream:false upstream: stream upstream and assemble.
+    oai_body["stream"] = True
+    status, detail, chunks = await _zen_stream_upstream(url, headers, oai_body, ip)
+    if chunks is None:
+        if status == 429:
+            raise HTTPException(429, f"Rate limit: {detail}")
+        raise HTTPException(status, f"Upstream error: {detail}")
+    try:
+        out = await _collect_chat_json(chunks, oai_body.get("model", "?"))
+    except UpstreamDead as e:
+        raise HTTPException(502, f"Upstream error: {e}")
+    out = _autocorrect_tool_calls_json(out, _client_tool_name_map(oai_body))
     _reject_empty_completion((out.get("choices") or [{}])[0])
     return _openai_to_anthropic(out, model)
 
@@ -2669,17 +2611,6 @@ async def anthropic_count_tokens(request: Request):
     counted = _pad_harness_tools(_fit_context(oai_body))
     input_tokens = (_estimate_tokens(counted.get("messages") or [])
                     + _estimate_tokens(counted.get("tools") or []))
-    # #region agent log
-    _dbg02("proxy.py:count_tokens",
-           "H5 tool definitions silently dropped by the OpenAI translation",
-           {"hypothesisId": "H5",
-            "n_tools_in": len(body.get("tools") or []),
-            "n_tools_out": len(oai_body.get("tools") or []),
-            "n_messages_out": len(oai_body.get("messages") or []),
-            "deflated": bool(body.get("tools")) and not oai_body.get("tools"),
-            "n_tools_counted": len(counted.get("tools") or []),
-            "input_tokens_returned": input_tokens})
-    # #endregion
     return {"input_tokens": input_tokens}
 
 
@@ -2702,12 +2633,6 @@ async def responses_proxy(request: Request):
     if body_json:
         body_json = _fit_context(body_json)
         body_json = _pad_harness_tools_responses(body_json)
-        # #region agent log
-        _dbg("proxy.py:responses_proxy:post-pad", "H4 name map after responses padding",
-             {"hypothesisId": "H4", "n_map": len(_client_tool_name_map(body_json)),
-              "n_tools": len(body_json.get("tools") or []),
-              "map": dict(list(_client_tool_name_map(body_json).items())[:8])})
-        # #endregion
         # Same model contract as /v1/chat/completions: strip the oc- prefix and
         # fall back to DEFAULT_MODEL for unknown IDs. Without this the prefix
         # reached Zen verbatim (invalid model) and unknown IDs were not mapped.
@@ -2763,19 +2688,6 @@ async def catch_all(path: str, request: Request):
         body_json = _fit_context(body_json)
         before_pad = body_json
         body_json = _pad_harness_tools(body_json)
-        # #region agent log
-        _dbg02("proxy.py:catch_all:post-pad",
-               "H6/H7 catch_all padding + name map on a possibly non-OpenAI body",
-               {"hypothesisId": "H6,H7", "path": path,
-                "body_keys": sorted(body_json.keys())[:14],
-                "n_tools_in": len(before_pad.get("tools") or []),
-                "n_tools_out": len(body_json.get("tools") or []),
-                "n_map": len(_client_tool_name_map(body_json)),
-                "tools_are_responses_shape": bool(body_json.get("tools"))
-                    and isinstance(body_json["tools"][0], dict)
-                    and "function" not in body_json["tools"][0],
-                "n_map_raw_before_pad": len(_client_tool_name_map(before_pad))})
-        # #endregion
         # Same model contract as /v1/chat/completions: strip the oc- prefix and
         # fall back to DEFAULT_MODEL for unknown IDs.
         if isinstance(body_json.get("model"), str):
@@ -2809,13 +2721,6 @@ async def catch_all(path: str, request: Request):
             raise HTTPException(405, "Method not allowed")
 
     ct = resp.headers.get("content-type", "")
-    # #region agent log
-    _dbg02("proxy.py:catch_all:passthrough",
-           "H8 passthrough response shape (non-JSON body becomes a JSON string)",
-           {"hypothesisId": "H8", "path": path, "status": resp.status_code,
-            "content_type": ct[:80], "is_json_ct": "application/json" in ct,
-            "body_preview": resp.text[:160] if not ("application/json" in ct) else None})
-    # #endregion
     if "application/json" in ct:
         try:
             content = resp.json()

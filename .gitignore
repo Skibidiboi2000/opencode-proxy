@@ -8,3 +8,7 @@ __pycache__/
 .cursor/
 .opencode/
 *.log
+
+# RE investigation artifacts (wire captures, replay scripts) — local-only.
+# Captures contain session ids / trace ids; keep them out of history.
+.investigate/
