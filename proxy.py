@@ -135,7 +135,7 @@ def _models_expired() -> bool:
 
 
 def _known_models() -> list:
-    return _MODEL_CACHE["ids"]
+    return [m for m in _MODEL_CACHE["ids"] if m not in DEPRECATED_MODELS]
 
 
 async def _refresh_models(force: bool = False) -> list:
@@ -179,7 +179,15 @@ async def _refresh_models(force: bool = False) -> list:
 # Client tools keep priority on name collisions; harness names skipped then.
 _HARNESS_TOOLS_PATH = os.path.join(os.path.dirname(__file__), "harness_tools.json")
 with open(_HARNESS_TOOLS_PATH) as _hf:
-    _HARNESS_TOOLS: list[dict] = json.load(_hf)
+    _all_tools: list = json.load(_hf)
+# 2026-10-15 evidence (n=3 each, upstream inference/v1, Bearer public): the free
+# tier gate rejects tool-less bodies (403 x3) but accepts a body carrying a
+# single tool LITERALLY named `read` — case-sensitive, name-only (a shallow
+# parameters={} stub passed 200 x3). Other genuine names alone (edit/bash/glob)
+# all 403 x3. So we pad with just `read` (~0.5KB) instead of all 13 (~24KB):
+# fewer prompt tokens on every request. harness_tools.json is kept intact as
+# the full historical set in case the gate ever requires the whole harness.
+_HARNESS_TOOLS = [t for t in _all_tools if t["function"]["name"] == "read"]
 _HARNESS_TOOL_NAMES = [t["function"]["name"] for t in _HARNESS_TOOLS]
 # A model may emit a padded harness tool with any casing (observed live:
 # "bash" and "read" for tools defined as "Bash"/"Read"). This set is the
@@ -911,9 +919,9 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
         return True
 
     def _is_junk_frame(frame: bytes) -> bool:
-        # Zen filler: empty-choices heartbeat chunks (muse-spark) and the
-        # trailing `{"choices":[],"cost":"0"}`. They carry no content,
-        # usage or finish, and 9Router misreads them as a dead model.
+        # Upstream filler: empty-choices heartbeat chunks and the trailing
+        # `{"choices":[],"cost":"0"}`. They carry no content, usage or finish,
+        # and 9Router misreads them as a dead model.
         junk = 0
         parsed = 0
         for line in frame.split(b"\n"):
@@ -1053,6 +1061,21 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
 # actually reach — mimo-v2.5-free was the old default but now returns 403
 # FreeTierError, which broke the entire unknown-ID fallback contract.
 DEFAULT_MODEL = "space-bunny-free"
+
+# Retired / unservable for the free anonymous tier (n=3, 2026-10-15):
+# - `-contributor-free` variants: delisted from the catalog AND retired —
+#   410 ModelDeprecated on chat AND responses.
+# - `muse-spark-1.2` / `1.3`: bare PAID catalog variants, still listed but 402
+#   insufficient_funds for `Bearer public`. A free-tier proxy must not
+#   advertise ids the free tier cannot serve.
+# Kept out of the client model list and the routing inventory so unknown-ID
+# fallback does its job.
+DEPRECATED_MODELS = {
+    "muse-spark-1.3-contributor-free",
+    "muse-spark-1.2-contributor-free",
+    "muse-spark-1.2",
+    "muse-spark-1.3",
+}
 
 _FINISH_TO_STOP = {
     "stop": "end_turn",
@@ -1718,9 +1741,11 @@ async def _zen_stream_parsed(url: str, headers: dict, body: dict, client_ip: str
 # zen's /chat/completions returns 500 for muse-spark (Console), while
 # /responses works — the opencode CLI itself talks the Responses API for this
 # model. 9Router only speaks chat/completions, so we translate both ways.
-# (muse-spark-1.2-contributor-free was dropped in v1.13.0: retired upstream.)
-
-RESPONSES_MODELS = {"muse-spark-1.3-contributor-free"}
+# (muse-spark-1.3: whole bridge left intact in the section keep-list, but the
+# model itself retired upstream 2026-10-15 — 410 ModelDeprecated, see
+# DEPRECATED_MODELS. The bridge stays; a new Responses-only free model only
+# needs to be added to RESPONSES_MODELS.)
+RESPONSES_MODELS: set[str] = set()
 
 # Models that only speak Anthropic's Messages API upstream, served via the
 # _chat_via_messages bridge below (mirroring RESPONSES_MODELS).
@@ -1798,7 +1823,9 @@ def _chat_to_responses(body: dict) -> dict:
         out["instructions"] = "\n\n".join(instructions)
     mt = body.get("max_tokens")
     if mt:
-        # muse-spark runs reasoning effort=high before answering; a small
+        # Muse-spark runs a private reasoning channel upstream and leaks it
+        # as reasoning deltas; several free models (deepseek etc.) do the
+        # same. Clients that don't understand it still get the answer text.
         # max_output_tokens is consumed by reasoning alone → response.incomplete
         # with zero text (the CLI never sets one). Give it headroom.
         out["max_output_tokens"] = max(int(mt), 2048)
