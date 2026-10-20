@@ -74,6 +74,9 @@ response is delivered.
 | `OUTBOUND_PROXY` | – | Optional egress proxy (`socks5://…`). Falls back to `HTTPS_PROXY`, then `HTTP_PROXY`; empty means direct connection. |
 | `RETRY_429` | `3` | Retries a Zen `429` with exponential backoff before surfacing it. Zen rate-limits the anonymous `Bearer public` identity per egress IP, so a per-minute throttle recovers on retry while a hard quota does not. Set `0` to never retry. |
 | `RETRY_429_BACKOFF` | `5.0` | Base seconds for the `429` backoff (`backoff * 2**(attempt-1)`) |
+| `OPENCODE_API_KEY` | – | Optional OpenCode API key (`oc_sk_…`). When set, requests use `Bearer <key>`. If upstream throttles the key (`429`, `FreeUsageLimitError`) the proxy resends at once as `Bearer public`, keeps using `public` while the key rests, then returns to the key. `/health` reports `api_key.active` and `resting_secs`. |
+| `API_KEY_COOLDOWN_SECS` | `300` | Seconds the key rests after a throttle (a `Retry-After` header overrides it, capped at 3600). |
+| `API_KEY_BAD_COOLDOWN_SECS` | `3600` | Seconds the key rests after `401`/`402` (revoked key, no balance). |
 
 ## Tests
 

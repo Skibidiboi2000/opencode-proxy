@@ -89,6 +89,59 @@ def _429_retry_delay(next_attempt: int, spent: float) -> Optional[float]:
         return None
     return min(RETRY_429_BACKOFF * (2 ** (next_attempt - 1)), remaining)
 
+
+# --- Optional API key with automatic fallback to the anonymous identity ---
+# With OPENCODE_API_KEY set, requests carry that key. When upstream answers the
+# key with a throttle (429 / FreeUsageLimitError) the key rests for a cooldown
+# and traffic continues as `Bearer public`; once the cooldown ends the key is
+# used again. 401/402 (revoked key, no balance) rest it much longer.
+API_KEY = os.environ.get("OPENCODE_API_KEY", "").strip()
+API_KEY_COOLDOWN_SECS = float(os.environ.get("API_KEY_COOLDOWN_SECS", "300"))
+API_KEY_BAD_COOLDOWN_SECS = float(os.environ.get("API_KEY_BAD_COOLDOWN_SECS", "3600"))
+_PUBLIC_AUTH = "Bearer public"
+_key_resting_until = 0.0  # time.monotonic() deadline
+
+
+def _key_available() -> bool:
+    return bool(API_KEY) and time.monotonic() >= _key_resting_until
+
+
+def _auth_value() -> str:
+    return f"Bearer {API_KEY}" if _key_available() else _PUBLIC_AUTH
+
+
+def _refresh_auth(headers: dict) -> dict:
+    """Re-pick the Authorization value at send time. Headers built before a
+    cooldown started (retry loops, pending retries) must not keep the key."""
+    if not API_KEY:
+        return headers
+    auth = _auth_value()
+    if headers.get("Authorization") == auth:
+        return headers
+    return {**headers, "Authorization": auth}
+
+
+def _note_key_response(headers: dict, status: int, raw: bytes = b"", retry_after: Optional[str] = None) -> bool:
+    """Rest the key when upstream rejected a request that carried it.
+    True means the caller should resend immediately (now as `public`)."""
+    global _key_resting_until
+    if not API_KEY or headers.get("Authorization") != f"Bearer {API_KEY}":
+        return False
+    if status in (401, 402):
+        secs = API_KEY_BAD_COOLDOWN_SECS
+    elif status == 429 or _is_rate_limit_error(status, raw):
+        secs = API_KEY_COOLDOWN_SECS
+        try:
+            secs = min(max(float(retry_after), 1.0), 3600.0) if retry_after else secs
+        except ValueError:
+            pass
+    else:
+        return False
+    _key_resting_until = max(_key_resting_until, time.monotonic() + secs)
+    logger.warning("[API KEY] upstream %s: key rests %.0fs, falling back to public", status, secs)
+    return True
+
+
 # After the 200 is committed the client sits on keepalive comments — and
 # 9Router demonstrably tolerates 40s+ TTFT on that connection. zen's 503
 # waves last minutes, far longer than any pre-commit window, so once committed
@@ -331,6 +384,30 @@ def _client_tool_names(tools, anthropic: bool) -> set:
     return names
 
 
+def _ensure_reasoning_content(body: dict) -> dict:
+    """Give every assistant message a `reasoning_content` key.
+
+    Zen's thinking-mode backends (deepseek-v4.1-flash-free) reject a history
+    whose assistant turns lack the field with 400 "The `reasoning_content` in
+    the thinking mode must be passed back to the API" (live 2026-10-19: the
+    same body failed 8/8 without it and passed 8/8 with it, even as ""). Clients
+    that drop reasoning on replay get an empty string; real values are kept."""
+    msgs = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(msgs, list):
+        return body
+    fixed = [
+        {**m, "reasoning_content": ""}
+        if isinstance(m, dict) and m.get("role") == "assistant" and "reasoning_content" not in m
+        else m
+        for m in msgs
+    ]
+    if fixed == msgs:
+        return body
+    out = dict(body)
+    out["messages"] = fixed
+    return out
+
+
 def _pad_harness_tools(body: dict) -> dict:
     """Append missing harness tool definitions (OpenAI format) to a
     chat.completions body. Client tools come first and win name collisions.
@@ -391,16 +468,22 @@ def _pad_harness_tools_responses(rbody: dict) -> dict:
     return out
 
 
-# Zen free tier models have a 1M-token context; fit oversized requests so the
-# upstream never rejects with a 1048576-token context error.
-CONTEXT_LIMIT = 1048576
+# Measured 2026-10-19 on deepseek-v4.1-flash-free (upstream prompt_tokens):
+# 329,578 tokens passed and a ~347k-token prompt got 400 context_length_exceeded,
+# so the real ceiling is ~330k even though the catalog advertises 1M. Fit
+# oversized requests under it so the upstream never rejects them.
+CONTEXT_LIMIT = 330000
 MIN_COMPLETION = 1024
 
-# One token ~ 4 bytes of serialized message. Single source of truth: the
-# /v1/messages/count_tokens endpoint and the _fit_context budget MUST agree, or
-# Claude Code compacts on a number the proxy never enforced (they diverged 2x
-# before this existed: //4 vs //2).
-_TOKENS_PER_BYTE_DIVISOR = 4
+# One token ~ 2 bytes of serialized message. Real density measured against
+# upstream prompt_tokens: English prose ~4.4 bytes/token, code ~2.3, JSON or
+# base64-like payloads ~1.5. //4 under-counted agent traffic (code and tool
+# output) by 1.6-2.6x, so 226-message sessions estimated at 205k tokens were
+# really >330k and failed. //2 over-counts prose and never under-counts code.
+# Single source of truth: the /v1/messages/count_tokens endpoint and the
+# _fit_context budget MUST agree, or Claude Code compacts on a number the
+# proxy never enforced.
+_TOKENS_PER_BYTE_DIVISOR = 2
 
 
 def _estimate_tokens(messages: list) -> int:
@@ -437,24 +520,54 @@ def _fit_context(body: dict) -> dict:
         return body
     items = list(raw)
     max_tokens = body.get("max_tokens") or 0
+    # Tool definitions (and Responses `instructions`) ride in the same prompt
+    # but live outside `items`; charge them or large tool sets overflow.
+    fixed_cost = _estimate_tokens(body.get("tools") or []) if body.get("tools") else 0
+    if isinstance(body.get("instructions"), str):
+        fixed_cost += _estimate_tokens(body["instructions"])
 
-    budget = int(CONTEXT_LIMIT * 0.9) - _message_cost(items)
+    budget = int(CONTEXT_LIMIT * 0.9) - fixed_cost - _message_cost(items)
 
-    while budget < MIN_COMPLETION and len(items) > 1:
-        # Drop the oldest turn. Always index 0: in Responses form the system
-        # prompt lives outside the list in `instructions`, and a leading system
-        # turn in chat form is the last thing we want to lose anyway.
-        idx = 0
-        items.pop(idx)
+    # Leading system/developer turns carry the agent's instructions; trimming
+    # starts after them. At least one non-pinned item always survives: an empty
+    # `messages` array is a hard 400 ("Empty input messages").
+    head = 0
+    while head < len(items) and isinstance(items[head], dict) and items[head].get("role") in ("system", "developer"):
+        head += 1
+
+    def _orphan(m) -> bool:
+        return isinstance(m, dict) and (m.get("role") == "tool" or m.get("type") == "function_call_output")
+
+    while budget < MIN_COMPLETION and len(items) - head > 1:
+        items.pop(head)
         # A "tool" message is only valid right after an assistant message with
         # tool_calls; once that assistant is dropped the trailing tool messages
-        # become orphans and upstream rejects with 400. Drop them in sync.
+        # become orphans and upstream rejects with 400. Drop them in sync, but
+        # never the last remaining item.
         # Responses encodes these as function_call_output items.
-        while idx < len(items) and (
-            items[idx].get("role") == "tool" or items[idx].get("type") == "function_call_output"
-        ):
-            items.pop(idx)
-        budget = int(CONTEXT_LIMIT * 0.9) - _message_cost(items)
+        while len(items) - head > 1 and _orphan(items[head]):
+            items.pop(head)
+        budget = int(CONTEXT_LIMIT * 0.9) - fixed_cost - _message_cost(items)
+
+    # A lone surviving tool result has no assistant tool_calls before it, which
+    # upstream rejects; present its content as a user turn instead.
+    if len(items) - head == 1 and isinstance(items[head], dict) and items[head].get("role") == "tool":
+        items[head] = {"role": "user", "content": items[head].get("content") or ""}
+
+    # One surviving item can still exceed the ceiling on its own (a huge tool
+    # result). Keep its tail, which holds the most recent output, instead of
+    # sending a prompt the upstream is certain to reject.
+    if budget < MIN_COMPLETION and len(items) - head == 1 and isinstance(items[head], dict):
+        last = items[head]
+        text = last.get("content")
+        if isinstance(text, str):
+            others = _message_cost(items[:head])
+            allowed_tokens = int(CONTEXT_LIMIT * 0.9) - MIN_COMPLETION - fixed_cost - others - 64
+            marker = "[... earlier content truncated to fit the context window ...]\n"
+            keep = allowed_tokens * _TOKENS_PER_BYTE_DIVISOR - len(marker)
+            if keep > 0 and len(text) > keep:
+                items[head] = {**last, "content": marker + text[-keep:]}
+                budget = int(CONTEXT_LIMIT * 0.9) - fixed_cost - _message_cost(items)
 
     out = dict(body)
     out[key] = items
@@ -565,7 +678,7 @@ def _get_session(user: str = "default") -> str:
 def _make_headers(session_id: str) -> dict[str, str]:
     return {
         "Content-Type": "application/json",
-        "Authorization": "Bearer public",
+        "Authorization": _auth_value(),
         "User-Agent": f"opencode/{OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.2",
         "x-opencode-client": "cli",
         "x-opencode-project": "global",
@@ -832,6 +945,7 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
     attempt_429 = 0
     spent_429 = 0.0
     while True:
+        headers = _refresh_auth(headers)
         client = _client(timeout=httpx.Timeout(180.0, connect=15.0))
         try:
             req = client.build_request("POST", url, headers=headers, json=body)
@@ -851,6 +965,11 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
             # also release the connection, not just plain HTTP errors.
             await client.aclose()
             raise
+        if resp.status_code in (401, 402, 429) and _note_key_response(headers, resp.status_code, b"", resp.headers.get("retry-after")):
+            await resp.aread()
+            await resp.aclose()
+            await client.aclose()
+            continue  # resend at once; _refresh_auth now picks `public`
         if resp.status_code == 429 and attempt_429 < RETRY_429:
             delay = _429_retry_delay(attempt_429 + 1, spent_429)
             if delay is None:
@@ -894,6 +1013,8 @@ async def _zen_stream_upstream(url: str, headers: dict, body: dict, client_ip: s
     dead, buffered, live_q = await _probe_sse_stream(resp, client, STATUS_HOLD_SECS)
     if dead is not None:
         logger.warning("[ZEN] dead 200-stream from %s: %s", client_ip, dead[1])
+        if dead[0] == 429 and _note_key_response(headers, 429):
+            return await _zen_stream_upstream(url, headers, body, client_ip)
         return dead[0], f"{dead[1]} (200)", None
 
     name_map = _client_tool_name_map(body)
@@ -1114,12 +1235,15 @@ def _anthropic_to_openai(body: dict) -> dict:
         text_parts: list[str] = []
         tool_calls: list[dict] = []
         tool_results: list[dict] = []
+        thinking_parts: list[str] = []
         for block in content or []:
             if not isinstance(block, dict):
                 continue
             btype = block.get("type")
             if btype == "text":
                 text_parts.append(block.get("text", ""))
+            elif btype == "thinking":
+                thinking_parts.append(block.get("thinking", ""))
             elif btype == "image":
                 src = block.get("source") or {}
                 if src.get("type") == "base64" and src.get("data") and src.get("media_type"):
@@ -1145,14 +1269,17 @@ def _anthropic_to_openai(body: dict) -> dict:
                 tool_results.append({"role": "tool", "tool_call_id": block.get("tool_use_id", ""), "content": text})
 
         if role == "assistant":
+            reasoning = "".join(thinking_parts)
             if tool_calls:
                 oai_messages.append({
                     "role": "assistant",
                     "content": "".join(t for t in text_parts if isinstance(t, str)) or None,
+                    "reasoning_content": reasoning,
                     "tool_calls": tool_calls,
                 })
             elif text_parts:
-                oai_messages.append({"role": "assistant", "content": "".join(t for t in text_parts if isinstance(t, str))})
+                oai_messages.append({"role": "assistant", "content": "".join(t for t in text_parts if isinstance(t, str)),
+                                     "reasoning_content": reasoning})
         else:
             oai_messages.extend(tool_results)
             if text_parts:
@@ -1623,6 +1750,7 @@ async def _zen_stream_parsed(url: str, headers: dict, body: dict, client_ip: str
     attempt_429 = 0
     spent_429 = 0.0
     while True:
+        headers = _refresh_auth(headers)
         client = _client(timeout=httpx.Timeout(180.0, connect=15.0))
         try:
             req = client.build_request("POST", url, headers=headers, json=body)
@@ -1639,6 +1767,11 @@ async def _zen_stream_parsed(url: str, headers: dict, body: dict, client_ip: str
         except BaseException:
             await client.aclose()
             raise
+        if resp.status_code in (401, 402, 429) and _note_key_response(headers, resp.status_code, b"", resp.headers.get("retry-after")):
+            await resp.aread()
+            await resp.aclose()
+            await client.aclose()
+            continue  # resend at once; _refresh_auth now picks `public`
         if resp.status_code == 429 and attempt_429 < RETRY_429:
             delay = _429_retry_delay(attempt_429 + 1, spent_429)
             if delay is None:
@@ -1682,6 +1815,8 @@ async def _zen_stream_parsed(url: str, headers: dict, body: dict, client_ip: str
     dead, buffered, live_q = await _probe_sse_stream(resp, client, STATUS_HOLD_SECS)
     if dead is not None:
         logger.warning("[ZEN] dead 200-stream from %s: %s", client_ip, dead[1])
+        if dead[0] == 429 and _note_key_response(headers, 429):
+            return await _zen_stream_parsed(url, headers, body, client_ip)
         return dead[0], f"{dead[1]} (200)", None
 
     name_map = _client_tool_name_map(body)
@@ -2454,7 +2589,10 @@ def _upstream_path(path: str) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": VERSION, "models": len(_model_map())}
+    out = {"status": "ok", "version": VERSION, "models": len(_model_map())}
+    if API_KEY:
+        out["api_key"] = {"active": _key_available(), "resting_secs": max(0, round(_key_resting_until - time.monotonic()))}
+    return out
 
 
 def _safe_json(resp: httpx.Response):
@@ -2487,6 +2625,7 @@ async def _post_with_retry(url: str, headers: dict, json_body: dict) -> httpx.Re
     attempt_429 = 0
     spent_429 = 0.0
     while True:
+        headers = _refresh_auth(headers)
         client = _client(timeout=httpx.Timeout(180.0, connect=15.0))
         try:
             resp = await client.post(url, headers=headers, json=json_body)
@@ -2501,6 +2640,8 @@ async def _post_with_retry(url: str, headers: dict, json_body: dict) -> httpx.Re
                 await asyncio.sleep(delay)
                 continue
             raise
+        if resp.status_code in (401, 402, 429) and _note_key_response(headers, resp.status_code, resp.content, resp.headers.get("retry-after")):
+            continue  # resend at once; _refresh_auth now picks `public`
         if resp.status_code == 429 and attempt_429 < RETRY_429:
             delay = _429_retry_delay(attempt_429 + 1, spent_429)
             if delay is None:
@@ -2533,6 +2674,7 @@ async def list_models():
 async def chat_completions(request: Request):
     body = await _json_body(request)
     body = _fit_context(body)
+    body = _ensure_reasoning_content(body)
     body = _pad_harness_tools(body)
     ip = _get_client_ip(request)
     session = _get_session(ip)
@@ -2685,6 +2827,9 @@ async def responses_proxy(request: Request):
             resp = await client.patch(url, headers=headers, json=body_json or {})
         else:
             raise HTTPException(405, "Method not allowed")
+    # Direct (non-retried) calls only rest the key; the caller's retry then uses `public`.
+    if resp.status_code in (401, 402, 429):
+        _note_key_response(headers, resp.status_code, resp.content, resp.headers.get("retry-after"))
     ct = resp.headers.get("content-type", "")
     if "application/json" in ct:
         # A lying content-type (200 + <html>Internal Server Error) must be a
@@ -2714,6 +2859,7 @@ async def catch_all(path: str, request: Request):
     if body_json:
         body_json = _fit_context(body_json)
         before_pad = body_json
+        body_json = _ensure_reasoning_content(body_json)
         body_json = _pad_harness_tools(body_json)
         # Same model contract as /v1/chat/completions: strip the oc- prefix and
         # fall back to DEFAULT_MODEL for unknown IDs.
@@ -2747,6 +2893,9 @@ async def catch_all(path: str, request: Request):
         else:
             raise HTTPException(405, "Method not allowed")
 
+    # Direct (non-retried) calls only rest the key; the caller's retry then uses `public`.
+    if resp.status_code in (401, 402, 429):
+        _note_key_response(headers, resp.status_code, resp.content, resp.headers.get("retry-after"))
     ct = resp.headers.get("content-type", "")
     if "application/json" in ct:
         try:
