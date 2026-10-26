@@ -59,24 +59,26 @@ required set. The case-variant twin is handled on the way back out — `_client_
 `_autocorrect_tool_calls_json` rewrite a model-emitted `read` to the client's `Read` before the
 response is delivered.
 
+If Zen answers a padded request with `403 FreeTierError`, the proxy retries once with the client's
+own tools (log line `[PAD]`). This covers the OpenCode CLI's utility requests such as title
+generation, which it sends with no tools: with a fresh session, Zen accepted that
+prompt only unpadded and refused the padded copy (live test 2026-10-21).
+
 ## Configuration
 
 | Env | Default | Purpose |
 |---|---|---|
 | `OPENCODE_BASE_URL` | `https://opencode.ai/inference/v1` | Upstream. Validated at import against an SSRF guard (http/https only, never loopback/private/reserved). `zen/v1` is a newer endpoint that requires an account key; `inference/v1` serves the anonymous free tier (`Bearer public`). |
-| `OPENCODE_SESSION` | – | Optional session id (`ses_…`) sent as `x-opencode-session`. Does not affect reachability. |
+| `OPENCODE_SESSION` | – | Forces one session id (`ses_…`) for ALL traffic. Leave unset: Zen counts the free allowance per session id, so a pinned id makes every client share one allowance that runs out within hours (live test 2026-10-21: pinned id → `429`, fresh id → `200`). Unset, the proxy forwards the client's own `x-opencode-session` / `x-session-id` when it is well formed, else mints one CLI-format id per conversation (client address + first user turn), kept across model switches. Zen rejects a malformed id with `403 FreeTierError`; valid ids look like `ses_` + 12 hex + 14 base62 characters. |
+| `SESSION_TTL_SECS` | `43200` | Idle seconds after which a conversation's session id is forgotten (the next request starts a new session). |
 | `MODELS_REFRESH_SECS` | `300` | Background discovery refresh interval |
 | `MODELS_TTL_SECS` | `900` | Age at which a cached inventory counts as stale |
 | `STATUS_HOLD_SECS` | `15` | Seconds to hold headers probing a 200 stream's health |
 | `UPSTREAM_RETRIES` | `2` | Retries transient upstream `502/503/504` and connect errors (`backoff * 2**(attempt-1)`) |
-| `UPSTREAM_RETRY_BACKOFF` | `0.4` | Base seconds for the transient-retry backoff |
 | `PENDING_RETRY_SECS` | `120` | Budget for post-commit upstream re-requests, served behind keepalives once HTTP 200 is already committed |
 | `OUTBOUND_PROXY` | – | Optional egress proxy (`socks5://…`). Falls back to `HTTPS_PROXY`, then `HTTP_PROXY`; empty means direct connection. |
-| `RETRY_429` | `3` | Retries a Zen `429` with exponential backoff before surfacing it. Zen rate-limits the anonymous `Bearer public` identity per egress IP, so a per-minute throttle recovers on retry while a hard quota does not. Set `0` to never retry. |
-| `RETRY_429_BACKOFF` | `5.0` | Base seconds for the `429` backoff (`backoff * 2**(attempt-1)`) |
-| `OPENCODE_API_KEY` | – | Optional OpenCode API key (`oc_sk_…`). When set, requests use `Bearer <key>`. If upstream throttles the key (`429`, `FreeUsageLimitError`) the proxy resends at once as `Bearer public`, keeps using `public` while the key rests, then returns to the key. `/health` reports `api_key.active` and `resting_secs`. |
-| `API_KEY_COOLDOWN_SECS` | `300` | Seconds the key rests after a throttle (a `Retry-After` header overrides it, capped at 3600). |
-| `API_KEY_BAD_COOLDOWN_SECS` | `3600` | Seconds the key rests after `401`/`402` (revoked key, no balance). |
+| `HARD_LIMIT_SECS` | `60` | A `429` whose `Retry-After` exceeds this is an exhausted free allowance, not a throttle. That session's use of that model is blocked: no retries, and its requests fail fast with a real `429` naming the reset time. Other sessions and models are unaffected; `/health` lists blocked models under `limited_models` (`sessions` blocked, soonest `resets_in` seconds). |
+| `MODEL_RECHECK_SECS` | `900` | While a session's model is blocked, one request re-probes upstream after this many seconds (or at reset, if sooner). |
 
 ## Tests
 
